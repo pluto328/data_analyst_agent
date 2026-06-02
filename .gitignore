@@ -1,0 +1,82 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# temp runtime files (keep directory placeholders)
+temp_files/**
+!temp_files/
+!temp_files/**/
+!temp_files/**/.gitkeep
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-wheel-metadata/
+
+# virtual env / conda
+.venv/
+venv/
+ENV/
+env/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# type check / lint
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cursorrules
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# streamlit
+.streamlit/secrets.toml
+
+# matplotlib / debug
+debug-*.log
+*.log
+
+# local test outputs at repo root
+*.png
+!docs/**/*.png

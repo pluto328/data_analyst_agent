@@ -1,0 +1,30 @@
+# base
+python-dotenv==1.0.1
+loguru==0.7.2
+psutil==6.1.0
+
+# data
+pandas==2.2.2
+numpy==1.26.4
+
+# excel/csv (xlrd 1.2.0 required for .xls on Windows)
+xlrd==1.2.0
+openpyxl==3.1.2
+
+# ui
+streamlit==1.36.0
+
+# AI Agent (LangChain 0.3.x; langchain 0.3.22 needs langchain-core>=0.3.49)
+langchain==0.3.22
+langchain-core==0.3.49
+langchain-text-splitters==0.3.7
+langchain-openai==0.2.8
+langgraph==0.2.18
+
+# charts (SimHei font configured in app for Windows CJK)
+matplotlib==3.8.4
+seaborn==0.13.2
+plotly==5.22.0
+
+# sandbox
+RestrictedPython==7.0
