@@ -22,7 +22,6 @@
 - **Agent**：LangChain 0.3.x + **LangGraph**（代码生成 / 执行回溯）
 - **数据**：Pandas、NumPy
 - **安全执行**：RestrictedPython 7.0
-- **向量检索（预留）**：ChromaDB + langchain-community（配置项已就绪，分步规划检索待后续迭代）
 - **依赖版本**：见根目录 `requirements.txt`
 
 ## 项目结构
@@ -32,7 +31,7 @@ data_analyst_agent/
 ├── main.py                  # Streamlit 入口（多文件上传、分析流水线）
 ├── .env                     # API 与运行参数（勿提交）
 ├── requirements.txt
-├── config/settings.py       # 上传限制、沙箱、向量检索等配置
+├── config/settings.py       # 上传限制、沙箱、日志等配置
 ├── utils/                   # 文件解析、路径、日志
 ├── agent/                   # 代码生成、LangGraph 工作流、报告生成
 │   ├── code_generator.py
@@ -69,16 +68,6 @@ MAX_UPLOAD_MB=20
 MAX_UPLOAD_FILES=10
 MAX_TOTAL_UPLOAD_MB=50
 LOG_LEVEL=INFO
-```
-
-可选（向量检索 / 分步规划，后续功能预留）：
-
-```env
-EMBEDDING_MODEL=text-embedding-3-small
-VECTOR_TOP_K=5
-ROW_CHUNK_SIZE=50
-LARGE_TABLE_ROW_THRESHOLD=100
-MAX_PLAN_STEPS=5
 ```
 
 智谱等 OpenAI 兼容接口示例：

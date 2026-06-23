@@ -39,11 +39,6 @@ _DEFAULT_MAX_UPLOAD_MB: int = 20
 _DEFAULT_MAX_UPLOAD_FILES: int = 10
 _DEFAULT_MAX_TOTAL_UPLOAD_MB: int = 50
 _DEFAULT_OPENAI_MODEL: str = "gpt-4o-mini"
-_DEFAULT_EMBEDDING_MODEL: str = "text-embedding-3-small"
-_DEFAULT_VECTOR_TOP_K: int = 5
-_DEFAULT_ROW_CHUNK_SIZE: int = 50
-_DEFAULT_LARGE_TABLE_ROW_THRESHOLD: int = 100
-_DEFAULT_MAX_PLAN_STEPS: int = 5
 _DEFAULT_LOG_LEVEL: str = "INFO"
 
 
@@ -125,19 +120,6 @@ MAX_TOTAL_UPLOAD_MB: int = _get_env_int(
 MAX_TOTAL_UPLOAD_BYTES: int = MAX_TOTAL_UPLOAD_MB * 1024 * 1024
 
 # ---------------------------------------------------------------------------
-# 向量检索
-# ---------------------------------------------------------------------------
-EMBEDDING_MODEL: str = _get_env_str("EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL)
-VECTOR_TOP_K: int = _get_env_int("VECTOR_TOP_K", _DEFAULT_VECTOR_TOP_K, minimum=1)
-ROW_CHUNK_SIZE: int = _get_env_int("ROW_CHUNK_SIZE", _DEFAULT_ROW_CHUNK_SIZE, minimum=10)
-LARGE_TABLE_ROW_THRESHOLD: int = _get_env_int(
-    "LARGE_TABLE_ROW_THRESHOLD",
-    _DEFAULT_LARGE_TABLE_ROW_THRESHOLD,
-    minimum=1,
-)
-MAX_PLAN_STEPS: int = _get_env_int("MAX_PLAN_STEPS", _DEFAULT_MAX_PLAN_STEPS, minimum=1)
-
-# ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
 LOG_LEVEL: str = _get_env_str("LOG_LEVEL", _DEFAULT_LOG_LEVEL).upper()
@@ -167,11 +149,8 @@ __all__ = [
     "ALLOWED_UPLOAD_SUFFIXES",
     "CSV_ENCODINGS",
     "CSV_SUFFIX",
-    "EMBEDDING_MODEL",
     "ENV_FILE",
-    "LARGE_TABLE_ROW_THRESHOLD",
     "LOG_LEVEL",
-    "MAX_PLAN_STEPS",
     "MAX_TOTAL_UPLOAD_BYTES",
     "MAX_TOTAL_UPLOAD_MB",
     "MAX_UPLOAD_BYTES",
@@ -183,10 +162,8 @@ __all__ = [
     "OPENAI_API_KEY",
     "OPENAI_MODEL",
     "PROJECT_ROOT",
-    "ROW_CHUNK_SIZE",
     "SANDBOX_TIMEOUT_SEC",
     "TEMP_DIR",
-    "VECTOR_TOP_K",
     "XLS_SUFFIX",
     "XLSX_SUFFIX",
     "configure_matplotlib",
