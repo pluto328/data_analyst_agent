@@ -45,17 +45,16 @@ def sanitize_filename_stem(filename: str) -> str:
     return cleaned
 
 
-def make_dataset_key(filename: str, existing_keys: set[str] | None = None) -> str:
-    """生成 ``df_{stem}`` 形式的沙箱变量名，冲突时追加序号。"""
+def make_dataset_key(index: int, existing_keys: set[str] | None = None) -> str:
+    """按上传顺序生成 ``df1``、``df2``、... 沙箱变量名。"""
+    if index < 1:
+        raise ValueError("index must be >= 1.")
     existing = existing_keys or set()
-    base = f"df_{sanitize_filename_stem(filename)}"
-    if base in _RESERVED_KEYS:
-        base = f"{base}_table"
-    candidate = base
-    counter = 2
+    candidate = f"df{index}"
+    counter = index
     while candidate in existing or candidate in _RESERVED_KEYS:
-        candidate = f"{base}_{counter}"
         counter += 1
+        candidate = f"df{counter}"
     return candidate
 
 

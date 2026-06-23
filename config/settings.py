@@ -40,6 +40,8 @@ _DEFAULT_MAX_UPLOAD_FILES: int = 10
 _DEFAULT_MAX_TOTAL_UPLOAD_MB: int = 50
 _DEFAULT_OPENAI_MODEL: str = "gpt-4o-mini"
 _DEFAULT_LOG_LEVEL: str = "INFO"
+_DEFAULT_CORRECTION_MAX_RECORDS: int = 200
+_DEFAULT_CORRECTION_TOP_K: int = 2
 
 
 def _load_dotenv() -> None:
@@ -84,6 +86,13 @@ def _get_env_int(key: str, default: int, *, minimum: int = 1) -> int:
     return max(minimum, parsed)
 
 
+def _get_env_bool(key: str, default: bool = True) -> bool:
+    raw = os.getenv(key)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 _load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -120,6 +129,21 @@ MAX_TOTAL_UPLOAD_MB: int = _get_env_int(
 MAX_TOTAL_UPLOAD_BYTES: int = MAX_TOTAL_UPLOAD_MB * 1024 * 1024
 
 # ---------------------------------------------------------------------------
+# 改错记录（few-shot 自我迭代）
+# ---------------------------------------------------------------------------
+CORRECTION_ENABLED: bool = _get_env_bool("CORRECTION_ENABLED", True)
+CORRECTION_MAX_RECORDS: int = _get_env_int(
+    "CORRECTION_MAX_RECORDS",
+    _DEFAULT_CORRECTION_MAX_RECORDS,
+    minimum=10,
+)
+CORRECTION_TOP_K: int = _get_env_int(
+    "CORRECTION_TOP_K",
+    _DEFAULT_CORRECTION_TOP_K,
+    minimum=1,
+)
+
+# ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
 LOG_LEVEL: str = _get_env_str("LOG_LEVEL", _DEFAULT_LOG_LEVEL).upper()
@@ -149,6 +173,9 @@ __all__ = [
     "ALLOWED_UPLOAD_SUFFIXES",
     "CSV_ENCODINGS",
     "CSV_SUFFIX",
+    "CORRECTION_ENABLED",
+    "CORRECTION_MAX_RECORDS",
+    "CORRECTION_TOP_K",
     "ENV_FILE",
     "LOG_LEVEL",
     "MAX_TOTAL_UPLOAD_BYTES",

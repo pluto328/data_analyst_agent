@@ -30,6 +30,7 @@ from config.settings import (
     SANDBOX_TIMEOUT_SEC,
     ensure_temp_dir,
 )
+from agent.correction_store import correction_record_count, ensure_correction_records_loaded
 from utils.file_parser import parse_uploaded_files
 from utils.logger import setup_logger
 from utils.path_helper import (
@@ -42,6 +43,16 @@ from visualization.chart_save import save_matplotlib_figure
 
 setup_logger()
 ensure_temp_dir()
+try:
+    ensure_correction_records_loaded()
+except Exception:
+    pass
+
+_CHART_TYPE_LABELS: dict[str, str] = {
+    "line": "折线图",
+    "bar": "柱状图",
+    "box": "箱线图",
+}
 
 
 def _init_session_state() -> None:
@@ -49,7 +60,6 @@ def _init_session_state() -> None:
         "datasets": None,
         "generated_code": "",
         "sandbox_ok": None,
-        "chart_paths": [],
         "report_markdown": "",
         "report_path": None,
         "result_csv_bytes": None,
@@ -60,15 +70,6 @@ def _init_session_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
-
-
-def _chart_dataframe(sandbox_result, datasets: list[DatasetInfo]) -> pd.DataFrame:
-    """优先用沙箱输出表，否则用主表。"""
-    if sandbox_result is not None and sandbox_result.df is not None:
-        return sandbox_result.df
-    if sandbox_result is not None and isinstance(sandbox_result.result, pd.DataFrame):
-        return sandbox_result.result
-    return primary_dataset(datasets).dataframe
 
 
 def _exportable_dataframe(sandbox_result) -> pd.DataFrame | None:
@@ -82,6 +83,16 @@ def _exportable_dataframe(sandbox_result) -> pd.DataFrame | None:
         return result.to_frame()
     if sandbox_result.df is not None and not sandbox_result.df.empty:
         return sandbox_result.df
+    return None
+
+
+def _result_chart_dataframe(sandbox_result, datasets: list[DatasetInfo]) -> pd.DataFrame | None:
+    """提取可用于结果区独立绘图的 DataFrame。"""
+    export_df = _exportable_dataframe(sandbox_result)
+    if export_df is not None:
+        return export_df
+    if sandbox_result is not None and sandbox_result.success:
+        return primary_dataset(datasets).dataframe
     return None
 
 
@@ -133,19 +144,83 @@ def _build_chart(
         return None
 
 
+def _render_standalone_chart_panel(
+    *,
+    panel_key: str,
+    df: pd.DataFrame,
+    title: str,
+) -> None:
+    """独立图表区：选择坐标后自动出图，不依赖 LLM 分析。"""
+    columns = [str(c) for c in df.columns]
+    if len(columns) < 2:
+        st.caption("至少需要 2 列才能绘图。")
+        return
+
+    x_default, y_default = _pick_default_columns(df)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        chart_type = st.selectbox(
+            "图表类型",
+            SUPPORTED_CHART_TYPES,
+            index=1,
+            format_func=lambda value: _CHART_TYPE_LABELS.get(value, value),
+            key=f"chart_type_{panel_key}",
+        )
+    with col2:
+        x_col = st.selectbox(
+            "X 轴列",
+            columns,
+            index=columns.index(x_default),
+            key=f"chart_x_{panel_key}",
+        )
+    with col3:
+        y_col = st.selectbox(
+            "Y 轴列",
+            columns,
+            index=columns.index(y_default),
+            key=f"chart_y_{panel_key}",
+        )
+
+    chart_path = _build_chart(df, chart_type, x_col, y_col, title=title)
+    if chart_path is not None and chart_path.is_file():
+        st.image(str(chart_path), use_container_width=True)
+
+
+def _render_upload_chart_section(datasets: list[DatasetInfo]) -> None:
+    st.subheader("2. 数据可视化")
+    st.caption("上传后即可选坐标出图，与分析流程无关。")
+
+    if len(datasets) > 1:
+        table_options = {ds.key: ds for ds in datasets}
+        selected_key = st.selectbox(
+            "选择要绘图的表",
+            list(table_options.keys()),
+            format_func=lambda key: (
+                f"{key}（{table_options[key].filename}）"
+            ),
+            key="upload_chart_table",
+        )
+        chart_df = table_options[selected_key].dataframe
+    else:
+        chart_df = datasets[0].dataframe
+
+    _render_standalone_chart_panel(
+        panel_key="upload",
+        df=chart_df,
+        title="原始数据图表",
+    )
+
+
 def _render_sidebar() -> dict[str, Any]:
     st.sidebar.header("分析设置")
     st.sidebar.caption(f"模型：`{OPENAI_MODEL}` · 沙箱超时：{SANDBOX_TIMEOUT_SEC}s")
-    enable_chart = st.sidebar.checkbox("生成可视化图表", value=True)
-    chart_type = st.sidebar.selectbox("图表类型", SUPPORTED_CHART_TYPES, index=1)
+    st.sidebar.caption(f"已加载改错记录：{correction_record_count()} 条")
     enable_report = st.sidebar.checkbox("生成 Markdown 报告", value=True)
     use_fallback_report = st.sidebar.checkbox(
         "报告 LLM 失败时使用模板降级",
         value=True,
     )
     return {
-        "enable_chart": enable_chart,
-        "chart_type": chart_type,
         "enable_report": enable_report,
         "use_fallback_report": use_fallback_report,
     }
@@ -163,47 +238,49 @@ def _render_upload_section() -> None:
             f"总大小不超过 {MAX_TOTAL_UPLOAD_MB} MB"
         ),
     )
-    if not uploaded_list:
+
+    if uploaded_list:
+        if len(uploaded_list) > MAX_UPLOAD_FILES:
+            st.error(f"最多上传 {MAX_UPLOAD_FILES} 个文件。")
+            return
+
+        try:
+            paths: list[Path] = []
+            original_names: list[str] = []
+            total_size = 0
+            for uploaded in uploaded_list:
+                if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
+                    raise ValueError(f"「{uploaded.name}」超过 {MAX_UPLOAD_MB} MB 限制。")
+                total_size += uploaded.size
+                original_names.append(uploaded.name)
+                paths.append(_save_uploaded_file(uploaded))
+            if total_size > MAX_TOTAL_UPLOAD_BYTES:
+                raise ValueError(f"总大小超过 {MAX_TOTAL_UPLOAD_MB} MB 限制。")
+
+            datasets = parse_uploaded_files(paths, original_filenames=original_names)
+            st.session_state.datasets = datasets
+
+            if len(datasets) == 1:
+                ds = datasets[0]
+                st.success(
+                    f"已加载：`{ds.filename}`（{ds.key}，"
+                    f"{ds.preview['shape'][0]} 行 × {ds.preview['shape'][1]} 列）"
+                )
+            else:
+                summary = "、".join(
+                    f"`{ds.key}`（{ds.filename}）" for ds in datasets
+                )
+                st.success(f"已加载 {len(datasets)} 张表：{summary}")
+
+        except Exception as exc:
+            st.session_state.datasets = None
+            st.error(f"文件解析失败：{exc}")
+            return
+
+    datasets: list[DatasetInfo] | None = st.session_state.datasets
+    if not datasets:
         return
 
-    if len(uploaded_list) > MAX_UPLOAD_FILES:
-        st.error(f"最多上传 {MAX_UPLOAD_FILES} 个文件。")
-        return
-
-    try:
-        paths: list[Path] = []
-        original_names: list[str] = []
-        total_size = 0
-        for uploaded in uploaded_list:
-            if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
-                raise ValueError(f"「{uploaded.name}」超过 {MAX_UPLOAD_MB} MB 限制。")
-            total_size += uploaded.size
-            original_names.append(uploaded.name)
-            paths.append(_save_uploaded_file(uploaded))
-        if total_size > MAX_TOTAL_UPLOAD_BYTES:
-            raise ValueError(f"总大小超过 {MAX_TOTAL_UPLOAD_MB} MB 限制。")
-
-        datasets = parse_uploaded_files(paths, original_filenames=original_names)
-        st.session_state.datasets = datasets
-
-        if len(datasets) == 1:
-            ds = datasets[0]
-            st.success(
-                f"已加载：`{ds.filename}`（{ds.key}，"
-                f"{ds.preview['shape'][0]} 行 × {ds.preview['shape'][1]} 列）"
-            )
-        else:
-            summary = "、".join(
-                f"`{ds.key}`（{ds.filename}）" for ds in datasets
-            )
-            st.success(f"已加载 {len(datasets)} 张表：{summary}")
-
-    except Exception as exc:
-        st.session_state.datasets = None
-        st.error(f"文件解析失败：{exc}")
-        return
-
-    datasets: list[DatasetInfo] = st.session_state.datasets
     with st.expander("数据预览", expanded=True):
         if len(datasets) == 1:
             st.dataframe(datasets[0].dataframe.head(15), use_container_width=True)
@@ -215,6 +292,8 @@ def _render_upload_section() -> None:
                     st.caption(f"{ds.filename} · {shape[0]} 行 × {shape[1]} 列")
                     st.dataframe(ds.dataframe.head(15), use_container_width=True)
 
+    _render_upload_chart_section(datasets)
+
 
 def _render_analysis_section(options: dict[str, Any]) -> None:
     datasets: list[DatasetInfo] | None = st.session_state.datasets
@@ -222,14 +301,14 @@ def _render_analysis_section(options: dict[str, Any]) -> None:
         st.info("请先上传并解析数据文件。")
         return
 
-    st.subheader("2. 描述分析需求")
+    st.subheader("3. 描述分析需求")
     if len(datasets) > 1:
         keys_hint = "、".join(ds.key for ds in datasets)
         placeholder = (
             f"例如：将 {datasets[0].key} 与 {datasets[1].key} 按 id 关联，"
             "汇总各品类金额并删除空值"
         )
-        st.caption(f"已加载表变量：{keys_hint}（df 指向第一张表 {datasets[0].key}）")
+        st.caption(f"已加载表变量：{keys_hint}（df 为 {datasets[0].key} 的别名）")
     else:
         placeholder = "例如：删除 amount 为空的行，按 category 汇总 value 并求和"
 
@@ -239,19 +318,6 @@ def _render_analysis_section(options: dict[str, Any]) -> None:
         height=120,
     )
 
-    chart_df = primary_dataset(datasets).dataframe
-    columns = [str(c) for c in chart_df.columns]
-    x_col, y_col = columns[0], columns[0]
-    if len(columns) >= 2:
-        x_col, y_col = _pick_default_columns(chart_df)
-        col1, col2 = st.columns(2)
-        with col1:
-            x_col = st.selectbox("图表 X 轴列", columns, index=columns.index(x_col))
-        with col2:
-            y_col = st.selectbox("图表 Y 轴列", columns, index=columns.index(y_col))
-    else:
-        st.caption("数据仅 1 列，将跳过图表绘制。")
-
     if st.button("开始分析", type="primary", use_container_width=True):
         if not user_request.strip():
             st.error("请填写分析需求。")
@@ -259,8 +325,6 @@ def _render_analysis_section(options: dict[str, Any]) -> None:
         _run_analysis_pipeline(
             user_request=user_request.strip(),
             options=options,
-            x_col=x_col,
-            y_col=y_col,
         )
 
 
@@ -268,14 +332,11 @@ def _run_analysis_pipeline(
     *,
     user_request: str,
     options: dict[str, Any],
-    x_col: str,
-    y_col: str,
 ) -> None:
     datasets: list[DatasetInfo] = st.session_state.datasets
     preview = merge_previews_for_legacy(datasets)
     df_dict = datasets_to_dict(datasets)
 
-    st.session_state.chart_paths = []
     st.session_state.report_markdown = ""
     st.session_state.report_path = None
     st.session_state.result_csv_bytes = None
@@ -338,7 +399,6 @@ def _run_analysis_pipeline(
             return
 
         st.write("代码执行成功")
-        chart_paths: list[str] = []
 
         export_df = _exportable_dataframe(sandbox_result)
         if export_df is not None:
@@ -349,26 +409,6 @@ def _run_analysis_pipeline(
                 st.session_state.result_csv_bytes = None
                 st.warning(f"结果表格导出准备失败：{exc}")
 
-        # 3. 可视化
-        chart_df = _chart_dataframe(sandbox_result, datasets)
-        if options["enable_chart"] and len(chart_df.columns) >= 2:
-            st.write("生成图表...")
-            try:
-                chart_path = _build_chart(
-                    chart_df,
-                    options["chart_type"],
-                    x_col,
-                    y_col,
-                    title="分析图表",
-                )
-                if chart_path:
-                    chart_paths.append(str(chart_path))
-            except ValueError as exc:
-                st.warning(str(exc))
-
-        st.session_state.chart_paths = chart_paths
-
-        # 4. 报告
         if options["enable_report"]:
             st.write("生成分析报告...")
             _maybe_generate_report(
@@ -377,12 +417,9 @@ def _run_analysis_pipeline(
                 sandbox_result,
                 graph_result.generated_code,
                 options,
-                chart_paths=chart_paths,
             )
 
         status.update(label="分析完成", state="complete")
-
-    _render_results_panel()
 
 
 def _maybe_generate_report(
@@ -391,17 +428,14 @@ def _maybe_generate_report(
     sandbox_result,
     generated_code: str,
     options: dict[str, Any],
-    *,
-    chart_paths: list[str] | None = None,
 ) -> None:
-    paths = chart_paths if chart_paths is not None else st.session_state.chart_paths
     try:
         report = generate_markdown_report(
             user_request,
             preview,
             sandbox_result,
             generated_code=generated_code,
-            chart_paths=paths,
+            chart_paths=[],
             save_to_file=True,
             report_title="analysis_report",
         )
@@ -416,7 +450,7 @@ def _maybe_generate_report(
                 preview,
                 sandbox_result,
                 generated_code=generated_code,
-                chart_paths=paths,
+                chart_paths=[],
             )
             try:
                 saved = save_report_markdown(fallback, title="analysis_report")
@@ -437,7 +471,7 @@ def _render_execution_results(sandbox_result) -> None:
 
 
 def _render_results_panel() -> None:
-    st.subheader("3. 分析结果")
+    st.subheader("4. 分析结果")
 
     code = st.session_state.generated_code
     if code:
@@ -483,15 +517,17 @@ def _render_results_panel() -> None:
                 mime="text/csv",
             )
 
-    chart_paths = st.session_state.chart_paths or []
-    if chart_paths:
-        st.markdown("**可视化图表**")
-        for path_str in chart_paths:
-            path = Path(path_str)
-            if path.suffix.lower() == ".png" and path.is_file():
-                st.image(str(path), caption=path.name)
-            else:
-                st.write(path.name)
+        datasets: list[DatasetInfo] | None = st.session_state.datasets
+        if datasets:
+            result_df = _result_chart_dataframe(sandbox_result, datasets)
+            if result_df is not None:
+                st.markdown("**处理结果可视化**")
+                st.caption("选择坐标后直接出图，与分析流程无关。")
+                _render_standalone_chart_panel(
+                    panel_key="result",
+                    df=result_df,
+                    title="处理结果图表",
+                )
 
     report_md = st.session_state.report_markdown
     if report_md:
@@ -515,12 +551,15 @@ def main() -> None:
 
     st.title("数据分析师 AI Agent")
     st.caption(
-        "上传表格（可多表）→ 自然语言描述需求 → 自动生成并安全执行 Pandas 代码 → 图表与报告"
+        "上传表格（可多表）→ 可选坐标即时出图 → 自然语言分析 → 结果区亦可独立绘图"
     )
 
     options = _render_sidebar()
     _render_upload_section()
     _render_analysis_section(options)
+
+    if st.session_state.sandbox_ok is not None or st.session_state.generated_code:
+        _render_results_panel()
 
 
 if __name__ == "__main__":

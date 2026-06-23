@@ -9,6 +9,7 @@ import pandas as pd
 from langgraph.graph import END, StateGraph
 
 from agent.code_generator import CodeGenerationError, generate_pandas_code
+from agent.correction_store import save_correction_from_retry_success
 from sandbox.code_sandbox import SandboxResult, execute_code
 from utils.logger import get_logger
 
@@ -241,9 +242,22 @@ def run_analysis_graph(
         )
 
     success = status == "success" and sandbox_result is not None and sandbox_result.success
+    generated_code = final_state.get("generated_code", "")
+
+    if success and retry_history:
+        try:
+            save_correction_from_retry_success(
+                user_request=user_request.strip(),
+                data_preview=data_preview,
+                retry_history=retry_history,
+                correct_code=generated_code,
+            )
+        except Exception as exc:
+            log.exception("Failed to persist correction record: {}", exc)
+
     return AnalysisGraphResult(
         success=success,
-        generated_code=final_state.get("generated_code", ""),
+        generated_code=generated_code,
         model=final_state.get("model", ""),
         sandbox_result=sandbox_result,
         retry_history=retry_history,

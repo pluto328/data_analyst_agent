@@ -12,6 +12,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from config.settings import OPENAI_API_BASE, OPENAI_API_KEY, OPENAI_MODEL
+from agent.correction_store import (
+    ensure_correction_records_loaded,
+    format_similar_corrections_for_prompt,
+)
 from sandbox.code_sandbox import compile_user_code
 from sandbox.safe_globals import SecurityError, validate_code_security
 from utils.logger import get_logger
@@ -30,16 +34,119 @@ SYSTEM_PROMPT = """你是数据分析代码生成助手，专门为 RestrictedPy
 2. 禁止 import / from 语句（沙箱已预置 pd、np）。
 3. 禁止 os、subprocess、open、eval、exec、网络与文件读写。
 4. 数据表变量：
-   - 单表时：使用 df（第一张表的副本）。
-   - 多表时：每张表有独立变量名（如 df_sales、df_users），df 仍指向第一张表。
-   - 多表关联使用 pd.merge、pd.concat 等；勿重新赋值覆盖已注入的表变量。
+   - 单表时：使用 df1（df 为 df1 的别名，二者等价）。
+   - 多表时：按上传顺序命名为 df1、df2、df3…；df 仍指向 df1。
+   - 多表关联使用 pd.merge(df1, df2, …)、pd.concat 等；勿覆盖 df1/df2 等已注入变量。
 5. 最终结果必须赋值给 result（可以是 DataFrame、Series、dict、list 或标量）。
-6. 如需保留清洗后的表，可更新 df 或新建变量（如 df_merged）；result 须代表本次分析结论。
-7. 仅使用 pandas / numpy 常见数据清洗、聚合、筛选、统计、关联方法。
-8. 代码应简洁、可一次执行成功，避免假设不存在的列名。
+6. 如需保留清洗后的表，可更新 df1 或新建变量（如 df_merged）；result 须代表本次分析结论。
+7. 仅使用 pandas / numpy 常见 API；列名必须来自预览 JSON，禁止臆造列名。
+8. 代码应简洁、可一次执行成功；优先链式中间变量，避免过度嵌套。
+
+## 常见用户需求 → 处理含义（语义对照）
+| 用户说法 | 含义 | 推荐写法 |
+|---------|------|---------|
+| 删除空值/去掉缺失/去除 NaN | 去掉含缺失值的行或列 | `dropna(subset=[...])` 或 `dropna(how='all')` |
+| 去重/重复行 | 删除完全重复记录 | `drop_duplicates(subset=[...], keep='first')` |
+| 筛选/过滤/只要/保留 | 按条件保留子集 | `df1[df1['列'] == 值]` 或 `df1[df1['列'].isin([...])]` |
+| 排序 | 按列升/降序 | `sort_values(by='列', ascending=False)` |
+| 分组/按…汇总/统计/求和/平均/计数 | 分组聚合 | `groupby(..., as_index=False).agg(...)` 或 `.sum()/mean()/count()` |
+| 透视/交叉表 | 行列维度汇总 | `pivot_table(index=..., columns=..., values=..., aggfunc=...)` |
+| 合并/关联/连接/join | 多表按键合并 | `pd.merge(df1, df2, on='键', how='inner/left/outer')` |
+| 纵向拼接/上下合并 | 同结构表堆叠 | `pd.concat([df1, df2], ignore_index=True)` |
+| 新增列/计算列/衍生 | 由现有列计算 | `df1['新列'] = ...` 或 `df1.assign(新列=...)` |
+| 重命名列 | 改列名 | `rename(columns={'旧':'新'})` |
+| 类型转换/转数值/转日期 | 修正 dtype | `astype(...)`、`pd.to_numeric(..., errors='coerce')`、`pd.to_datetime(...)` |
+| 填充缺失/补全 | 用常数或统计量填 NaN | `fillna(0)` 或 `fillna(df1['列'].mean())` |
+| 替换/改成 | 值映射 | `replace({旧: 新})` |
+| 取前 N / Top N / 排名 | 前几条或排序截取 | `nlargest(n, '列')` 或 `sort_values(...).head(n)` |
+| 描述统计/概况 | 数值列统计 | `describe()` 或 `agg(['mean','sum','count'])` |
+| 计数/各…有多少 | 分类频次 | `value_counts()` 或 `groupby(...).size()` |
+| 唯一值/ distinct | 去重后的值 | `drop_duplicates()` 或 `unique()` |
+| 重置索引 | 恢复默认行号 | `reset_index(drop=True)` |
+
+## 代码书写模板（按需选用，替换为真实列名）
+### 模板 A：单表清洗 + 聚合（最常用）
+```python
+work = df1.copy()
+work = work.dropna(subset=['关键列'])
+work = work[work['状态列'] == '目标值']
+result = (
+    work.groupby('分组列', as_index=False)['数值列']
+    .sum()
+    .sort_values('数值列', ascending=False)
+)
+```
+
+### 模板 B：单表筛选 + 统计标量
+```python
+work = df1.dropna(subset=['amount'])
+filtered = work[work['category'] == 'A']
+result = filtered['amount'].sum()
+```
+
+### 模板 C：双表关联 + 汇总
+```python
+merged = pd.merge(df1, df2, on='id', how='inner')
+merged = merged.dropna(subset=['amount'])
+result = merged.groupby('category', as_index=False)['amount'].sum()
+```
+
+### 模板 D：多表纵向合并
+```python
+combined = pd.concat([df1, df2], ignore_index=True)
+result = combined.drop_duplicates()
+```
+
+### 模板 E：透视分析
+```python
+result = df1.pivot_table(
+    index='行维度',
+    columns='列维度',
+    values='数值',
+    aggfunc='sum',
+    fill_value=0,
+)
+```
+
+### 模板 F：新增计算列后输出
+```python
+work = df1.copy()
+work['total'] = work['price'] * work['qty']
+result = work.sort_values('total', ascending=False)
+```
+
+## 编码规范
+1. 先用 `work = df1.copy()`（或多表时 `merged = pd.merge(...)`）再变换，避免误改注入变量。
+2. 写 `subset=`、`on=`、`by=` 时列名必须与预览 JSON 中 `columns` 完全一致（区分大小写）。
+3. 数值计算前对非数值列用 `pd.to_numeric(..., errors='coerce')`。
+4. 日期列用 `pd.to_datetime(..., errors='coerce')` 再比较或提取年月。
+5. `groupby` 后若需继续当表用，加 `as_index=False` 或 `.reset_index()`。
+6. 最后一行必须是 `result = ...`；不要把最终结果只赋给其它变量。
+7. 禁止 `print` 代替 result；禁止返回 None。
+
+## Debug 方式（收到上次失败信息时必须执行）
+1. **先读错误类型再改代码**，不要盲目重写：
+   - `KeyError`：列名不存在 → 对照预览 JSON 的 `columns` 修正拼写；多表时确认列在哪个表。
+   - `TypeError`：类型不匹配 → 先 `astype` / `to_numeric` / `to_datetime`；避免字符串与数字直接运算。
+   - `ValueError`：参数非法 → 检查 merge 的 `on` 键是否两表都有；groupby 列是否存在。
+   - `AttributeError`：对象无此属性 → 确认上一步返回的是 DataFrame 而非 Series/标量。
+   - `IndexError`：索引越界 → 改用条件筛选，避免硬编码行号。
+2. **最小改动原则**：只修复报错点，保留正确逻辑，不要换用全新思路。
+3. **Merge 失败**：先 `print` 不可用；改用更安全的 `how='left'`，并检查键列 dtype 是否一致（必要时 `.astype(str)` 统一）。
+4. **空结果**：检查 `dropna` / 筛选条件是否过严；用更宽条件或分步保留中间变量。
+5. **仍须满足沙箱约束**：无 import、无 open、最终赋值 result。
 
 ## 输出格式
 仅输出一个 ```python 代码块，或纯 Python 代码。"""
+
+_RETRY_DEBUG_HINTS: dict[str, str] = {
+    "KeyError": "列名不存在：对照预览 JSON 的 columns 修正；多表时确认列属于 df1 还是 df2。",
+    "TypeError": "类型错误：对参与运算的列先用 pd.to_numeric / pd.to_datetime / astype 转换。",
+    "ValueError": "参数或数据不合法：检查 merge 的 on 键、groupby 列、dropna subset 是否存在。",
+    "AttributeError": "对象类型不对：确认上一步返回的是 DataFrame；Series 需 to_frame() 或换写法。",
+    "IndexError": "索引越界：改用布尔筛选 df1[df1['列']==值]，不要硬编码 iloc 行号。",
+    "SecurityError": "违反沙箱规则：删除 import/open/eval/exec 等，仅保留 pd/np 数据处理。",
+}
 
 
 class CodeGenerationError(RuntimeError):
@@ -63,9 +170,9 @@ def format_data_context(data_preview: dict[str, Any]) -> str:
             "dataset_count": data_preview.get("dataset_count"),
             "dataset_keys": data_preview.get("dataset_keys"),
             "datasets": data_preview["all_datasets"],
-            "primary_table_key": data_preview.get("dataset_keys", ["df"])[0]
+            "primary_table_key": data_preview.get("dataset_keys", ["df1"])[0]
             if data_preview.get("dataset_keys")
-            else "df",
+            else "df1",
         }
     else:
         context = {
@@ -82,6 +189,28 @@ def format_data_context(data_preview: dict[str, Any]) -> str:
         raise ValueError("Failed to serialize data preview.") from exc
 
 
+def _retry_debug_section(
+    *,
+    previous_code: str,
+    previous_error: str,
+    previous_error_type: str,
+    retry_count: int,
+) -> str:
+    """组装回溯重试时的 debug 指引。"""
+    hint = _RETRY_DEBUG_HINTS.get(
+        previous_error_type.strip(),
+        "通读报错信息，对照预览 JSON 检查列名、类型与 merge/groupby 参数。",
+    )
+    return (
+        f"## 上次执行失败（第 {retry_count} 次失败后请求修复）\n"
+        f"- 错误类型：{previous_error_type or 'Unknown'}\n"
+        f"- 错误信息：{previous_error.strip()}\n"
+        f"- 修复提示：{hint}\n\n"
+        f"失败代码：\n```python\n{previous_code.strip()}\n```\n\n"
+        "请按 Debug 方式最小改动修复，仍须满足沙箱约束，并赋值 result。\n\n"
+    )
+
+
 def build_user_message(
     user_request: str,
     data_preview: dict[str, Any],
@@ -95,19 +224,28 @@ def build_user_message(
     if not user_request or not user_request.strip():
         raise ValueError("user_request cannot be empty.")
     context = format_data_context(data_preview)
-    message = (
-        f"用户需求：{user_request.strip()}\n\n"
-        f"数据表预览（JSON）：\n{context}\n\n"
+    ensure_correction_records_loaded()
+    correction_section = format_similar_corrections_for_prompt(
+        user_request.strip(),
+        data_preview,
+        error_type=previous_error_type.strip() or None,
+        retry_count=retry_count,
     )
+    message = f"用户需求：{user_request.strip()}\n\n"
+    if correction_section:
+        message += correction_section
+    message += f"数据表预览（JSON）：\n{context}\n\n"
     if previous_code.strip() and previous_error.strip():
-        message += (
-            f"## 上次执行失败（第 {retry_count} 次失败后请求修复）\n"
-            f"- 错误类型：{previous_error_type or 'Unknown'}\n"
-            f"- 错误信息：{previous_error.strip()}\n\n"
-            f"失败代码：\n```python\n{previous_code.strip()}\n```\n\n"
-            "请根据错误修正代码，仍须满足沙箱约束，并赋值 result。\n\n"
+        message += _retry_debug_section(
+            previous_code=previous_code,
+            previous_error=previous_error,
+            previous_error_type=previous_error_type,
+            retry_count=retry_count,
         )
-    message += "请生成满足需求的 Pandas 代码。"
+    message += (
+        "请根据用户需求与预览 JSON 中的列名，"
+        "选用合适模板生成 Pandas 代码。"
+    )
     return message
 
 
@@ -250,9 +388,8 @@ def _run_self_check(*, live: bool = False) -> None:
 
     sample_response = (
         "```python\n"
-        "import pandas as pd\n"
-        "df = df.dropna(subset=['amount'])\n"
-        "result = df['amount'].sum()\n"
+        "work = df1.dropna(subset=['amount'])\n"
+        "result = work['amount'].sum()\n"
         "```"
     )
     extracted = sanitize_generated_code(extract_python_code(sample_response))

@@ -191,7 +191,7 @@ def parse_uploaded_files(
             if original_filenames is not None
             else parsed["filename"]
         )
-        key = make_dataset_key(display_name, existing_keys)
+        key = make_dataset_key(index + 1, existing_keys)
         existing_keys.add(key)
         preview = {k: v for k, v in parsed.items() if k != "dataframe"}
         preview["filename"] = display_name

@@ -116,6 +116,30 @@ class SecurityError(ValueError):
     """用户代码未通过安全校验。"""
 
 
+_SANDBOX_UNWRAPPED_WRITE_TYPES: tuple[type, ...] = (
+    dict,
+    list,
+    pd.DataFrame,
+    pd.Series,
+    np.ndarray,
+)
+
+
+def _allow_direct_write(ob: Any) -> bool:
+    """判断是否跳过 RestrictedPython Wrapper（允许 subscript / loc 写入）。"""
+    if isinstance(ob, _SANDBOX_UNWRAPPED_WRITE_TYPES) or hasattr(ob, "_guarded_writes"):
+        return True
+    module = getattr(type(ob), "__module__", "") or ""
+    return module.startswith(("pandas.", "numpy."))
+
+
+def sandbox_write_guard(ob: Any) -> Any:
+    """对 pandas/numpy 对象跳过 Wrapper，允许列赋值与 loc/iloc 写入。"""
+    if _allow_direct_write(ob):
+        return ob
+    return full_write_guard(ob)
+
+
 class _SecurityVisitor(ast.NodeVisitor):
     """AST 静态扫描：拦截 import、危险调用与 dunder 访问。"""
 
@@ -203,7 +227,7 @@ def build_execution_globals(
         "__builtins__": safe_builtins,
         "_print_": PrintCollector,
         "_getattr_": safer_getattr,
-        "_write_": full_write_guard,
+        "_write_": sandbox_write_guard,
         "_getitem_": lambda obj, index: obj[index],
         "_getiter_": iter,
         "_iter_unpack_sequence_": guarded_unpack_sequence,
@@ -253,6 +277,7 @@ __all__ = [
     "SecurityError",
     "build_execution_globals",
     "extract_outputs",
+    "sandbox_write_guard",
     "scan_forbidden_text",
     "validate_code_security",
 ]

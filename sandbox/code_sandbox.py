@@ -233,6 +233,14 @@ def run_security_audit() -> list[dict[str, Any]]:
             "pandas_dropna",
             "df = df.dropna()\nresult = df.shape",
         ),
+        (
+            "pandas_setitem",
+            "df['total'] = df['value'] * 2\nresult = df.shape",
+        ),
+        (
+            "pandas_loc_assign",
+            "df.loc[0, 'value'] = 99\nresult = df.loc[0, 'value']",
+        ),
     ]
 
     sample_df = pd.DataFrame(
