@@ -9,6 +9,12 @@ import pandas as pd
 import streamlit as st
 
 from agent.analysis_graph import run_analysis_graph
+from agent.dataset_registry import (
+    DatasetInfo,
+    datasets_to_dict,
+    merge_previews_for_legacy,
+    primary_dataset,
+)
 from agent.report_generator import (
     ReportGenerationError,
     build_fallback_report,
@@ -16,12 +22,15 @@ from agent.report_generator import (
     save_report_markdown,
 )
 from config.settings import (
+    MAX_TOTAL_UPLOAD_BYTES,
+    MAX_TOTAL_UPLOAD_MB,
+    MAX_UPLOAD_FILES,
     MAX_UPLOAD_MB,
     OPENAI_MODEL,
     SANDBOX_TIMEOUT_SEC,
     ensure_temp_dir,
 )
-from utils.file_parser import parse_uploaded_file
+from utils.file_parser import parse_uploaded_files
 from utils.logger import setup_logger
 from utils.path_helper import (
     UPLOAD_SUBDIR,
@@ -37,13 +46,14 @@ ensure_temp_dir()
 
 def _init_session_state() -> None:
     defaults = {
-        "parsed": None,
-        "upload_path": None,
+        "datasets": None,
         "generated_code": "",
         "sandbox_ok": None,
         "chart_paths": [],
         "report_markdown": "",
         "report_path": None,
+        "result_csv_bytes": None,
+        "result_csv_name": "processed_result.csv",
         "retry_history": [],
         "graph_attempts": 0,
     }
@@ -52,8 +62,35 @@ def _init_session_state() -> None:
             st.session_state[key] = value
 
 
-def _preview_without_df(parsed: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in parsed.items() if k != "dataframe"}
+def _chart_dataframe(sandbox_result, datasets: list[DatasetInfo]) -> pd.DataFrame:
+    """优先用沙箱输出表，否则用主表。"""
+    if sandbox_result is not None and sandbox_result.df is not None:
+        return sandbox_result.df
+    if sandbox_result is not None and isinstance(sandbox_result.result, pd.DataFrame):
+        return sandbox_result.result
+    return primary_dataset(datasets).dataframe
+
+
+def _exportable_dataframe(sandbox_result) -> pd.DataFrame | None:
+    """从沙箱结果中提取可导出的表格（优先 result，其次 df）。"""
+    if sandbox_result is None or not sandbox_result.success:
+        return None
+    result = sandbox_result.result
+    if isinstance(result, pd.DataFrame) and not result.empty:
+        return result
+    if isinstance(result, pd.Series):
+        return result.to_frame()
+    if sandbox_result.df is not None and not sandbox_result.df.empty:
+        return sandbox_result.df
+    return None
+
+
+def _dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """转为 CSV 字节流（utf-8-sig，便于 Excel 打开）。"""
+    try:
+        return df.to_csv(index=False).encode("utf-8-sig")
+    except Exception as exc:
+        raise ValueError("Failed to serialize DataFrame to CSV.") from exc
 
 
 def _save_uploaded_file(uploaded_file) -> Path:
@@ -116,49 +153,97 @@ def _render_sidebar() -> dict[str, Any]:
 
 def _render_upload_section() -> None:
     st.subheader("1. 上传数据")
-    uploaded = st.file_uploader(
-        "支持 CSV / XLS / XLSX",
+    uploaded_list = st.file_uploader(
+        "支持 CSV / XLS / XLSX（可多选，用于多表关联分析）",
         type=["csv", "xls", "xlsx"],
-        help=f"单文件不超过 {MAX_UPLOAD_MB} MB",
+        accept_multiple_files=True,
+        help=(
+            f"单文件不超过 {MAX_UPLOAD_MB} MB，"
+            f"最多 {MAX_UPLOAD_FILES} 个文件，"
+            f"总大小不超过 {MAX_TOTAL_UPLOAD_MB} MB"
+        ),
     )
-    if uploaded is None:
+    if not uploaded_list:
+        return
+
+    if len(uploaded_list) > MAX_UPLOAD_FILES:
+        st.error(f"最多上传 {MAX_UPLOAD_FILES} 个文件。")
         return
 
     try:
-        path = _save_uploaded_file(uploaded)
-        parsed = parse_uploaded_file(path)
-        st.session_state.upload_path = str(path)
-        st.session_state.parsed = parsed
-        st.success(f"已加载：`{parsed['filename']}`（{parsed['shape'][0]} 行 × {parsed['shape'][1]} 列）")
+        paths: list[Path] = []
+        original_names: list[str] = []
+        total_size = 0
+        for uploaded in uploaded_list:
+            if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
+                raise ValueError(f"「{uploaded.name}」超过 {MAX_UPLOAD_MB} MB 限制。")
+            total_size += uploaded.size
+            original_names.append(uploaded.name)
+            paths.append(_save_uploaded_file(uploaded))
+        if total_size > MAX_TOTAL_UPLOAD_BYTES:
+            raise ValueError(f"总大小超过 {MAX_TOTAL_UPLOAD_MB} MB 限制。")
+
+        datasets = parse_uploaded_files(paths, original_filenames=original_names)
+        st.session_state.datasets = datasets
+
+        if len(datasets) == 1:
+            ds = datasets[0]
+            st.success(
+                f"已加载：`{ds.filename}`（{ds.key}，"
+                f"{ds.preview['shape'][0]} 行 × {ds.preview['shape'][1]} 列）"
+            )
+        else:
+            summary = "、".join(
+                f"`{ds.key}`（{ds.filename}）" for ds in datasets
+            )
+            st.success(f"已加载 {len(datasets)} 张表：{summary}")
+
     except Exception as exc:
-        st.session_state.parsed = None
+        st.session_state.datasets = None
         st.error(f"文件解析失败：{exc}")
         return
 
-    preview = _preview_without_df(st.session_state.parsed)
+    datasets: list[DatasetInfo] = st.session_state.datasets
     with st.expander("数据预览", expanded=True):
-        #只展示前15行
-        st.dataframe(st.session_state.parsed["dataframe"].head(15), use_container_width=True)
+        if len(datasets) == 1:
+            st.dataframe(datasets[0].dataframe.head(15), use_container_width=True)
+        else:
+            tabs = st.tabs([f"{ds.key}" for ds in datasets])
+            for tab, ds in zip(tabs, datasets):
+                with tab:
+                    shape = ds.preview["shape"]
+                    st.caption(f"{ds.filename} · {shape[0]} 行 × {shape[1]} 列")
+                    st.dataframe(ds.dataframe.head(15), use_container_width=True)
 
 
 def _render_analysis_section(options: dict[str, Any]) -> None:
-    parsed = st.session_state.parsed
-    if not parsed:
+    datasets: list[DatasetInfo] | None = st.session_state.datasets
+    if not datasets:
         st.info("请先上传并解析数据文件。")
         return
 
     st.subheader("2. 描述分析需求")
+    if len(datasets) > 1:
+        keys_hint = "、".join(ds.key for ds in datasets)
+        placeholder = (
+            f"例如：将 {datasets[0].key} 与 {datasets[1].key} 按 id 关联，"
+            "汇总各品类金额并删除空值"
+        )
+        st.caption(f"已加载表变量：{keys_hint}（df 指向第一张表 {datasets[0].key}）")
+    else:
+        placeholder = "例如：删除 amount 为空的行，按 category 汇总 value 并求和"
+
     user_request = st.text_area(
         "用自然语言描述你想做的清洗或分析",
-        placeholder="例如：删除 amount 为空的行，按 category 汇总 value 并求和",
+        placeholder=placeholder,
         height=120,
     )
 
-    df: pd.DataFrame = parsed["dataframe"]
-    columns = [str(c) for c in df.columns]
+    chart_df = primary_dataset(datasets).dataframe
+    columns = [str(c) for c in chart_df.columns]
     x_col, y_col = columns[0], columns[0]
     if len(columns) >= 2:
-        x_col, y_col = _pick_default_columns(df)
+        x_col, y_col = _pick_default_columns(chart_df)
         col1, col2 = st.columns(2)
         with col1:
             x_col = st.selectbox("图表 X 轴列", columns, index=columns.index(x_col))
@@ -186,18 +271,19 @@ def _run_analysis_pipeline(
     x_col: str,
     y_col: str,
 ) -> None:
-    parsed = st.session_state.parsed
-    preview = _preview_without_df(parsed)
-    df: pd.DataFrame = parsed["dataframe"]
+    datasets: list[DatasetInfo] = st.session_state.datasets
+    preview = merge_previews_for_legacy(datasets)
+    df_dict = datasets_to_dict(datasets)
 
     st.session_state.chart_paths = []
     st.session_state.report_markdown = ""
     st.session_state.report_path = None
+    st.session_state.result_csv_bytes = None
 
     with st.status("分析进行中...", expanded=True) as status:
         st.write("运行 LangGraph 工作流（生成代码 ↔ 沙箱执行，失败最多回溯 3 次）...")
         try:
-            graph_result = run_analysis_graph(user_request, preview, df)
+            graph_result = run_analysis_graph(user_request, preview, df_dict)
         except Exception as exc:
             status.update(label="分析失败", state="error")
             st.error(f"工作流异常：{exc}")
@@ -212,34 +298,9 @@ def _run_analysis_pipeline(
             st.write(f"模型：{graph_result.model} · 共尝试 {graph_result.total_attempts} 轮")
 
         if graph_result.retry_history:
-            # #region agent log
-            try:
-                import json
-                import time
-                from pathlib import Path as _Path
-
-                _Path("debug-014dc4.log").open("a", encoding="utf-8").write(
-                    json.dumps(
-                        {
-                            "sessionId": "014dc4",
-                            "hypothesisId": "A",
-                            "location": "main.py:retry-in-status",
-                            "message": "render retry summary inside st.status (no nested expander)",
-                            "data": {"retry_count": len(graph_result.retry_history)},
-                            "timestamp": int(time.time() * 1000),
-                            "runId": "post-fix",
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-            except Exception:
-                pass
-            # #endregion
             st.warning(
                 f"经历 {len(graph_result.retry_history)} 次执行失败后回溯重试"
             )
-            # st.status 内部也是 expander，不可再嵌套 st.expander
             for record in graph_result.retry_history:
                 st.caption(
                     f"第 {record['attempt']} 次失败："
@@ -279,10 +340,19 @@ def _run_analysis_pipeline(
         st.write("代码执行成功")
         chart_paths: list[str] = []
 
+        export_df = _exportable_dataframe(sandbox_result)
+        if export_df is not None:
+            try:
+                st.session_state.result_csv_bytes = _dataframe_to_csv_bytes(export_df)
+                st.session_state.result_csv_name = "processed_result.csv"
+            except ValueError as exc:
+                st.session_state.result_csv_bytes = None
+                st.warning(f"结果表格导出准备失败：{exc}")
+
         # 3. 可视化
-        if options["enable_chart"] and len(df.columns) >= 2:
+        chart_df = _chart_dataframe(sandbox_result, datasets)
+        if options["enable_chart"] and len(chart_df.columns) >= 2:
             st.write("生成图表...")
-            chart_df = sandbox_result.df if sandbox_result.df is not None else df
             try:
                 chart_path = _build_chart(
                     chart_df,
@@ -404,6 +474,15 @@ def _render_results_panel() -> None:
             st.markdown("**输出数据表（df）**")
             st.dataframe(sandbox_result.df, use_container_width=True)
 
+        result_csv = st.session_state.get("result_csv_bytes")
+        if result_csv:
+            st.download_button(
+                label="下载处理结果 CSV",
+                data=result_csv,
+                file_name=st.session_state.get("result_csv_name", "processed_result.csv"),
+                mime="text/csv",
+            )
+
     chart_paths = st.session_state.chart_paths or []
     if chart_paths:
         st.markdown("**可视化图表**")
@@ -436,7 +515,7 @@ def main() -> None:
 
     st.title("数据分析师 AI Agent")
     st.caption(
-        "上传表格 → 自然语言描述需求 → 自动生成并安全执行 Pandas 代码 → 图表与报告"
+        "上传表格（可多表）→ 自然语言描述需求 → 自动生成并安全执行 Pandas 代码 → 图表与报告"
     )
 
     options = _render_sidebar()

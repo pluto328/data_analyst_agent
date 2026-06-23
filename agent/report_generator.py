@@ -136,7 +136,7 @@ def build_report_user_message(
     if not data_preview:
         raise ValueError("data_preview cannot be empty.")
 
-    preview_payload = {
+    preview_payload: dict[str, Any] = {
         "filename": data_preview.get("filename"),
         "shape": data_preview.get("shape"),
         "columns": data_preview.get("columns"),
@@ -144,6 +144,10 @@ def build_report_user_message(
         "null_counts": data_preview.get("null_counts"),
         "head": data_preview.get("head"),
     }
+    if data_preview.get("all_datasets"):
+        preview_payload["dataset_count"] = data_preview.get("dataset_count")
+        preview_payload["dataset_keys"] = data_preview.get("dataset_keys")
+        preview_payload["all_datasets"] = data_preview["all_datasets"]
     try:
         preview_json = json.dumps(preview_payload, ensure_ascii=False, indent=2)
     except Exception as exc:

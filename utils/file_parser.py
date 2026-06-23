@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from agent.dataset_registry import DatasetInfo, make_dataset_key
 from config.settings import (
     CSV_ENCODINGS,
     CSV_SUFFIX,
@@ -167,6 +168,47 @@ def parse_uploaded_file(
     }
 
 
+def parse_uploaded_files(
+    paths: list[str | Path],
+    *,
+    original_filenames: list[str] | None = None,
+    sheet_name: str | int = 0,
+    head_rows: int = 5,
+) -> list[DatasetInfo]:
+    """批量解析上传文件，为每张表分配唯一沙箱变量名。"""
+    if not paths:
+        raise ValueError("paths cannot be empty.")
+    if original_filenames is not None and len(original_filenames) != len(paths):
+        raise ValueError("original_filenames length must match paths.")
+
+    datasets: list[DatasetInfo] = []
+    existing_keys: set[str] = set()
+
+    for index, path in enumerate(paths):
+        parsed = parse_uploaded_file(path, sheet_name=sheet_name, head_rows=head_rows)
+        display_name = (
+            original_filenames[index]
+            if original_filenames is not None
+            else parsed["filename"]
+        )
+        key = make_dataset_key(display_name, existing_keys)
+        existing_keys.add(key)
+        preview = {k: v for k, v in parsed.items() if k != "dataframe"}
+        preview["filename"] = display_name
+        datasets.append(
+            DatasetInfo(
+                key=key,
+                filename=display_name,
+                path=parsed["path"],
+                preview=preview,
+                dataframe=parsed["dataframe"],
+            )
+        )
+
+    log.info("Parsed {} dataset(s): {}", len(datasets), [ds.key for ds in datasets])
+    return datasets
+
+
 def _run_self_check() -> None:
     """模块内置自检，便于 ``python -m utils.file_parser`` 调试。"""
     from utils.path_helper import OUTPUT_SUBDIR, build_temp_file_path, delete_path
@@ -203,6 +245,7 @@ def _run_self_check() -> None:
 __all__ = [
     "check_file_size",
     "parse_uploaded_file",
+    "parse_uploaded_files",
     "preview_dataframe",
     "read_csv_file",
     "read_excel_file",

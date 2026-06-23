@@ -193,9 +193,13 @@ def validate_code_security(code: str) -> None:
         raise SecurityError("; ".join(visitor.violations))
 
 
-def build_execution_globals(df: pd.DataFrame) -> dict[str, Any]:
+def build_execution_globals(
+    df: pd.DataFrame | None = None,
+    *,
+    datasets: dict[str, pd.DataFrame] | None = None,
+) -> dict[str, Any]:
     """构建 RestrictedPython 执行环境（仅注入白名单模块与副本数据）。"""
-    return {
+    namespace: dict[str, Any] = {
         "__builtins__": safe_builtins,
         "_print_": PrintCollector,
         "_getattr_": safer_getattr,
@@ -205,8 +209,21 @@ def build_execution_globals(df: pd.DataFrame) -> dict[str, Any]:
         "_iter_unpack_sequence_": guarded_unpack_sequence,
         "pd": pd,
         "np": np,
-        "df": df.copy(),
     }
+
+    if datasets:
+        for key, frame in datasets.items():
+            namespace[key] = frame.copy()
+        if len(datasets) == 1:
+            namespace["df"] = next(iter(datasets.values())).copy()
+        elif "df" not in namespace and datasets:
+            namespace["df"] = next(iter(datasets.values())).copy()
+    elif df is not None:
+        namespace["df"] = df.copy()
+    else:
+        raise ValueError("Either df or datasets must be provided.")
+
+    return namespace
 
 
 def extract_outputs(namespace: dict[str, Any]) -> dict[str, Any]:

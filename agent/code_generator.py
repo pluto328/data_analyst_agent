@@ -27,12 +27,15 @@ SYSTEM_PROMPT = """你是数据分析代码生成助手，专门为 RestrictedPy
 
 ## 硬性约束（必须遵守）
 1. 只输出可执行的 Python 代码，不要解释文字。
-2. 禁止 import / from 语句（沙箱已预置 pd、np、df）。
+2. 禁止 import / from 语句（沙箱已预置 pd、np）。
 3. 禁止 os、subprocess、open、eval、exec、网络与文件读写。
-4. 输入数据变量名固定为 df（DataFrame 副本）。
+4. 数据表变量：
+   - 单表时：使用 df（第一张表的副本）。
+   - 多表时：每张表有独立变量名（如 df_sales、df_users），df 仍指向第一张表。
+   - 多表关联使用 pd.merge、pd.concat 等；勿重新赋值覆盖已注入的表变量。
 5. 最终结果必须赋值给 result（可以是 DataFrame、Series、dict、list 或标量）。
-6. 如需保留清洗后的表，可更新 df；但 result 必须能代表本次分析结论。
-7. 仅使用 pandas / numpy 常见数据清洗、聚合、筛选、统计方法。
+6. 如需保留清洗后的表，可更新 df 或新建变量（如 df_merged）；result 须代表本次分析结论。
+7. 仅使用 pandas / numpy 常见数据清洗、聚合、筛选、统计、关联方法。
 8. 代码应简洁、可一次执行成功，避免假设不存在的列名。
 
 ## 输出格式
@@ -51,18 +54,28 @@ class CodeGenerationResult:
 
 
 def format_data_context(data_preview: dict[str, Any]) -> str:
-    """将 file_parser 预览摘要格式化为 LLM 可读上下文。"""
+    """将 file_parser / dataset_registry 预览摘要格式化为 LLM 可读上下文。"""
     if not data_preview:
         raise ValueError("data_preview cannot be empty.")
 
-    context = {
-        "filename": data_preview.get("filename"),
-        "shape": data_preview.get("shape"),
-        "columns": data_preview.get("columns"),
-        "dtypes": data_preview.get("dtypes"),
-        "null_counts": data_preview.get("null_counts"),
-        "head": data_preview.get("head"),
-    }
+    if data_preview.get("all_datasets"):
+        context: dict[str, Any] = {
+            "dataset_count": data_preview.get("dataset_count"),
+            "dataset_keys": data_preview.get("dataset_keys"),
+            "datasets": data_preview["all_datasets"],
+            "primary_table_key": data_preview.get("dataset_keys", ["df"])[0]
+            if data_preview.get("dataset_keys")
+            else "df",
+        }
+    else:
+        context = {
+            "filename": data_preview.get("filename"),
+            "shape": data_preview.get("shape"),
+            "columns": data_preview.get("columns"),
+            "dtypes": data_preview.get("dtypes"),
+            "null_counts": data_preview.get("null_counts"),
+            "head": data_preview.get("head"),
+        }
     try:
         return json.dumps(context, ensure_ascii=False, indent=2)
     except Exception as exc:

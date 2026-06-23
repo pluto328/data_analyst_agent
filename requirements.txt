@@ -20,6 +20,8 @@ langchain-core==0.3.49
 langchain-text-splitters==0.3.7
 langchain-openai==0.2.8
 langgraph==0.2.18
+langchain-community==0.3.22
+chromadb==0.5.23
 
 # charts (SimHei font configured in app for Windows CJK)
 matplotlib==3.8.4

@@ -28,7 +28,7 @@ class RetryRecord(TypedDict):
 class AnalysisState(TypedDict, total=False):
     user_request: str
     data_preview: dict[str, Any]
-    dataframe: pd.DataFrame
+    datasets: dict[str, pd.DataFrame]
     max_retries: int
 
     retry_count: int
@@ -90,9 +90,9 @@ def _generate_code_node(state: AnalysisState) -> AnalysisState:
 def _execute_code_node(state: AnalysisState) -> AnalysisState:
     """在沙箱中执行当前 generated_code。"""
     code = state.get("generated_code", "")
-    df = state["dataframe"]
+    datasets = state["datasets"]
     try:
-        sandbox_result = execute_code(code, df)
+        sandbox_result = execute_code(code, datasets=datasets)
     except Exception as exc:
         log.exception("Sandbox execution raised in graph node")
         sandbox_result = SandboxResult(
@@ -182,20 +182,23 @@ def build_analysis_graph():
 def run_analysis_graph(
     user_request: str,
     data_preview: dict[str, Any],
-    dataframe: pd.DataFrame,
+    datasets: dict[str, pd.DataFrame],
     *,
     max_retries: int = MAX_CODE_RETRIES,
 ) -> AnalysisGraphResult:
     """运行完整 生成-执行-回溯 工作流。"""
     if not user_request.strip():
         raise ValueError("user_request cannot be empty.")
-    if dataframe is None or dataframe.empty:
-        raise ValueError("dataframe cannot be empty.")
+    if not datasets:
+        raise ValueError("datasets cannot be empty.")
+    for key, frame in datasets.items():
+        if frame is None or frame.empty:
+            raise ValueError(f"dataset {key!r} cannot be empty.")
 
     initial: AnalysisState = {
         "user_request": user_request.strip(),
         "data_preview": data_preview,
-        "dataframe": dataframe,
+        "datasets": datasets,
         "max_retries": max_retries,
         "retry_count": 0,
         "previous_code": "",

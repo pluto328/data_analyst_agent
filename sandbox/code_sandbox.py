@@ -59,7 +59,7 @@ def compile_user_code(code: str) -> Any:
     return byte_code
 
 
-def _sandbox_child_entry(code: str, df_path: str, conn) -> None:
+def _sandbox_child_entry(code: str, datasets_path: str, conn) -> None:
     """子进程入口：二次校验后在隔离环境中执行代码。"""
     try:
         validate_code_security(code)
@@ -68,12 +68,15 @@ def _sandbox_child_entry(code: str, df_path: str, conn) -> None:
             raise SecurityError("RestrictedPython returned empty bytecode.")
 
         try:
-            df_bytes = Path(df_path).read_bytes()
-            df = pickle.loads(df_bytes)
+            datasets_bytes = Path(datasets_path).read_bytes()
+            datasets = pickle.loads(datasets_bytes)
         except Exception as exc:
-            raise RuntimeError(f"Failed to load dataframe: {exc}") from exc
+            raise RuntimeError(f"Failed to load datasets: {exc}") from exc
 
-        namespace = build_execution_globals(df)
+        if not isinstance(datasets, dict):
+            raise RuntimeError("datasets payload must be a dict.")
+
+        namespace = build_execution_globals(datasets=datasets)
         exec(byte_code, namespace)
         payload = extract_outputs(namespace)
         conn.send(
@@ -119,27 +122,37 @@ def _terminate_process(process: mp.Process) -> None:
 
 def execute_code(
     code: str,
-    df: pd.DataFrame,
+    df: pd.DataFrame | None = None,
     *,
+    datasets: dict[str, pd.DataFrame] | None = None,
     timeout_sec: int | None = None,
 ) -> SandboxResult:
     """在子进程中安全执行用户代码，并返回 ``result`` / ``df``。"""
+    if df is None and not datasets:
+        raise ValueError("Either df or datasets must be provided.")
+    if datasets is None:
+        if df is None:
+            raise ValueError("df cannot be None when datasets is not provided.")
+        datasets = {"df": df}
+
     timeout = timeout_sec if timeout_sec is not None else SANDBOX_TIMEOUT_SEC
     compile_user_code(code)
 
     sandbox_dir = ensure_subdirectory(SANDBOX_SUBDIR)
-    df_path = sandbox_dir / f"df_{uuid.uuid4().hex}.pkl"
+    datasets_path = sandbox_dir / f"datasets_{uuid.uuid4().hex}.pkl"
     try:
         try:
-            df_path.write_bytes(pickle.dumps(df, protocol=pickle.HIGHEST_PROTOCOL))
+            datasets_path.write_bytes(
+                pickle.dumps(datasets, protocol=pickle.HIGHEST_PROTOCOL)
+            )
         except Exception as exc:
-            raise SandboxExecutionError(f"Failed to serialize dataframe: {exc}") from exc
+            raise SandboxExecutionError(f"Failed to serialize datasets: {exc}") from exc
 
         ctx = mp.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         process = ctx.Process(
             target=_sandbox_child_entry,
-            args=(code, str(df_path), child_conn),
+            args=(code, str(datasets_path), child_conn),
             daemon=True,
         )
         try:
@@ -193,9 +206,9 @@ def execute_code(
         )
     finally:
         try:
-            delete_path(df_path)
+            delete_path(datasets_path)
         except OSError:
-            log.exception("Failed to delete sandbox dataframe pickle: {}", df_path)
+            log.exception("Failed to delete sandbox datasets pickle: {}", datasets_path)
 
 
 def run_security_audit() -> list[dict[str, Any]]:
