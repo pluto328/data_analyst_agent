@@ -14,10 +14,11 @@ import pandas as pd
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from agent.code_generator import CodeGenerationError, create_chat_model
-from config.settings import OPENAI_MODEL
+from config.settings import MAX_OUTPUT_TABLES, OPENAI_MODEL
 from sandbox.code_sandbox import SandboxResult
 from utils.logger import get_logger
 from utils.path_helper import OUTPUT_SUBDIR, build_temp_file_path, delete_path
+from utils.result_tables import extract_result_tables
 
 log = get_logger()
 # 匹配 Markdown 代码块
@@ -81,7 +82,19 @@ def _json_safe(value: Any) -> Any:
             "name": str(value.name),
             "preview": value.head(20).to_dict(),
         }
-    if isinstance(value, (dict, list, str, int, float, bool)):
+    if isinstance(value, dict):
+        converted: dict[str, Any] = {}
+        for key, item in value.items():
+            if isinstance(item, pd.DataFrame):
+                converted[str(key)] = _json_safe(item)
+            elif isinstance(item, pd.Series):
+                converted[str(key)] = _json_safe(item)
+            else:
+                converted[str(key)] = _json_safe(item)
+        return converted
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
 
@@ -93,6 +106,16 @@ def format_execution_context(
     stdout: str = "",
 ) -> str:
     """将沙箱执行结果格式化为 LLM 可读 JSON。"""
+    output_tables, truncated = extract_result_tables(sandbox_result)
+    tables_payload = [
+        {
+            "name": table.name,
+            "filename": table.filename,
+            "shape": list(table.dataframe.shape),
+            "preview": table.dataframe.head(5).to_dict(orient="records"),
+        }
+        for table in output_tables
+    ]
     payload = {
         "success": sandbox_result.success,
         "timed_out": sandbox_result.timed_out,
@@ -101,6 +124,10 @@ def format_execution_context(
         "stdout": stdout or sandbox_result.stdout,
         "generated_code": generated_code.strip(),
         "result": _json_safe(sandbox_result.result),
+        "output_tables": tables_payload,
+        "output_table_count": len(tables_payload),
+        "output_truncated": truncated,
+        "max_output_tables": MAX_OUTPUT_TABLES,
         "output_shape": (
             list(sandbox_result.df.shape) if sandbox_result.df is not None else None
         ),
@@ -210,11 +237,21 @@ def build_fallback_report(
         lines.extend(["### 执行代码", "```python", generated_code.strip(), "```", ""])
 
     if sandbox_result.success:
-        lines.append(f"- 分析结果：`{_json_safe(sandbox_result.result)}`")
+        output_tables, truncated = extract_result_tables(sandbox_result)
+        if output_tables:
+            lines.append(f"- 输出表数量：{len(output_tables)}（上限 {MAX_OUTPUT_TABLES}）")
+            for table in output_tables:
+                shape = table.dataframe.shape
+                lines.append(
+                    f"- `{table.name}`（{table.filename}）："
+                    f"{shape[0]} 行 × {shape[1]} 列"
+                )
+            if truncated:
+                lines.append("- 备注：部分输出表因数量上限未全部展示。")
+        else:
+            lines.append(f"- 分析结果：`{_json_safe(sandbox_result.result)}`")
         if sandbox_result.stdout.strip():
             lines.append(f"- 标准输出：{sandbox_result.stdout.strip()}")
-        if sandbox_result.df is not None:
-            lines.append(f"- 输出表规模：{sandbox_result.df.shape[0]} 行 × {sandbox_result.df.shape[1]} 列")
     else:
         lines.append(f"- 错误类型：{sandbox_result.error_type or 'Unknown'}")
         lines.append(f"- 错误信息：{sandbox_result.error or '无'}")

@@ -11,7 +11,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
-from config.settings import OPENAI_API_BASE, OPENAI_API_KEY, OPENAI_MODEL
+from config.settings import MAX_OUTPUT_TABLES, OPENAI_API_BASE, OPENAI_API_KEY, OPENAI_MODEL
 from agent.correction_store import (
     ensure_correction_records_loaded,
     format_similar_corrections_for_prompt,
@@ -33,12 +33,18 @@ SYSTEM_PROMPT = """你是数据分析代码生成助手，专门为 RestrictedPy
 1. 只输出可执行的 Python 代码，不要解释文字。
 2. 禁止 import / from 语句（沙箱已预置 pd、np）。
 3. 禁止 os、subprocess、open、eval、exec、网络与文件读写。
-4. 数据表变量：
+4. 数据表变量（**仅用于代码，前端对用户显示文件名**）：
    - 单表时：使用 df1（df 为 df1 的别名，二者等价）。
    - 多表时：按上传顺序命名为 df1、df2、df3…；df 仍指向 df1。
+   - 预览 JSON 中每张表含 `filename`（用户可见）与 `sandbox_key`（如 df1）；用户自然语言可能说文件名，你必须映射到对应 sandbox_key 写代码。
    - 多表关联使用 pd.merge(df1, df2, …)、pd.concat 等；勿覆盖 df1/df2 等已注入变量。
-5. 最终结果必须赋值给 result（可以是 DataFrame、Series、dict、list 或标量）。
-6. 如需保留清洗后的表，可更新 df1 或新建变量（如 df_merged）；result 须代表本次分析结论。
+5. 最终结果必须赋值给 result，支持以下形式：
+   - **单表**：`result = 某个DataFrame` 或 Series
+   - **多表（按需求输出多张）**：`result = {{'表名1': df_a, '表名2': df_b, ...}}`
+     - 键名为**中文或英文短名**，须贴合用户需求语义（如 `'品类汇总'`、`'清洗明细'`），系统将用作下载文件名
+     - **最多 __MAX_OUTPUT_TABLES__ 张**（含单表）；超出则只保留最重要的前 __MAX_OUTPUT_TABLES__ 张
+     - 禁止用 `df1`/`df2` 作为输出表名；输出表名应对用户可读
+6. 中间过程变量可自由命名；**仅 result 中的表会作为最终交付结果**。
 7. 仅使用 pandas / numpy 常见 API；列名必须来自预览 JSON，禁止臆造列名。
 8. 代码应简洁、可一次执行成功；优先链式中间变量，避免过度嵌套。
 
@@ -115,6 +121,17 @@ work['total'] = work['price'] * work['qty']
 result = work.sort_values('total', ascending=False)
 ```
 
+### 模板 G：按需求输出多张表（dict + 自动命名）
+```python
+cleaned = df1.dropna(subset=['amount'])
+summary = cleaned.groupby('category', as_index=False)['amount'].sum()
+detail = cleaned[cleaned['amount'] > 0]
+result = {{
+    '品类汇总': summary,
+    '有效明细': detail,
+}}
+```
+
 ## 编码规范
 1. 先用 `work = df1.copy()`（或多表时 `merged = pd.merge(...)`）再变换，避免误改注入变量。
 2. 写 `subset=`、`on=`、`by=` 时列名必须与预览 JSON 中 `columns` 完全一致（区分大小写）。
@@ -137,10 +154,12 @@ result = work.sort_values('total', ascending=False)
 5. **仍须满足沙箱约束**：无 import、无 open、最终赋值 result。
 
 ## 输出格式
-仅输出一个 ```python 代码块，或纯 Python 代码。"""
+仅输出一个 ```python 代码块，或纯 Python 代码。""".replace(
+    "__MAX_OUTPUT_TABLES__", str(MAX_OUTPUT_TABLES)
+)
 
 _RETRY_DEBUG_HINTS: dict[str, str] = {
-    "KeyError": "列名不存在：对照预览 JSON 的 columns 修正；多表时确认列属于 df1 还是 df2。",
+    "KeyError": "列名不存在：对照预览 JSON 的 columns 修正；多表时确认列属于哪张 filename/sandbox_key。",
     "TypeError": "类型错误：对参与运算的列先用 pd.to_numeric / pd.to_datetime / astype 转换。",
     "ValueError": "参数或数据不合法：检查 merge 的 on 键、groupby 列、dropna subset 是否存在。",
     "AttributeError": "对象类型不对：确认上一步返回的是 DataFrame；Series 需 to_frame() 或换写法。",
@@ -168,9 +187,12 @@ def format_data_context(data_preview: dict[str, Any]) -> str:
     if data_preview.get("all_datasets"):
         context: dict[str, Any] = {
             "dataset_count": data_preview.get("dataset_count"),
-            "dataset_keys": data_preview.get("dataset_keys"),
             "datasets": data_preview["all_datasets"],
-            "primary_table_key": data_preview.get("dataset_keys", ["df1"])[0]
+            "note": (
+                "用户可能用 filename 指代表；生成代码时使用各表 sandbox_key（df1/df2/...）。"
+            ),
+            "primary_filename": data_preview.get("filename"),
+            "primary_sandbox_key": data_preview.get("dataset_keys", ["df1"])[0]
             if data_preview.get("dataset_keys")
             else "df1",
         }
@@ -243,8 +265,13 @@ def build_user_message(
             retry_count=retry_count,
         )
     message += (
+        f"输出表数量上限：{MAX_OUTPUT_TABLES} 张（result 为 dict 时键名即下载文件名）。\n\n"
+        if MAX_OUTPUT_TABLES
+        else ""
+    )
+    message += (
         "请根据用户需求与预览 JSON 中的列名，"
-        "选用合适模板生成 Pandas 代码。"
+        "选用合适模板生成 Pandas 代码；若需多张输出表，使用 result=dict 并为每张表取语义化键名。"
     )
     return message
 

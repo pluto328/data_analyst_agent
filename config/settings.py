@@ -9,6 +9,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# Windows：避免 libiomp5md.dll 重复初始化导致 Streamlit/图表进程异常退出
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 # ---------------------------------------------------------------------------
 # 路径（相对本文件定位项目根目录）
 # ---------------------------------------------------------------------------
@@ -42,6 +45,7 @@ _DEFAULT_OPENAI_MODEL: str = "gpt-4o-mini"
 _DEFAULT_LOG_LEVEL: str = "INFO"
 _DEFAULT_CORRECTION_MAX_RECORDS: int = 200
 _DEFAULT_CORRECTION_TOP_K: int = 2
+_DEFAULT_MAX_OUTPUT_TABLES: int = 5
 
 
 def _load_dotenv() -> None:
@@ -144,6 +148,15 @@ CORRECTION_TOP_K: int = _get_env_int(
 )
 
 # ---------------------------------------------------------------------------
+# 输出结果表
+# ---------------------------------------------------------------------------
+MAX_OUTPUT_TABLES: int = _get_env_int(
+    "MAX_OUTPUT_TABLES",
+    _DEFAULT_MAX_OUTPUT_TABLES,
+    minimum=1,
+)
+
+# ---------------------------------------------------------------------------
 # 日志
 # ---------------------------------------------------------------------------
 LOG_LEVEL: str = _get_env_str("LOG_LEVEL", _DEFAULT_LOG_LEVEL).upper()
@@ -178,6 +191,7 @@ __all__ = [
     "CORRECTION_TOP_K",
     "ENV_FILE",
     "LOG_LEVEL",
+    "MAX_OUTPUT_TABLES",
     "MAX_TOTAL_UPLOAD_BYTES",
     "MAX_TOTAL_UPLOAD_MB",
     "MAX_UPLOAD_BYTES",

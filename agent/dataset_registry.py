@@ -24,8 +24,8 @@ class DatasetInfo:
     def compact_schema(self) -> dict[str, Any]:
         """不含行数据的紧凑 schema，供规划与 LLM 上下文使用。"""
         return {
-            "key": self.key,
             "filename": self.filename,
+            "sandbox_key": self.key,
             "shape": self.preview.get("shape"),
             "columns": self.preview.get("columns"),
             "dtypes": self.preview.get("dtypes"),

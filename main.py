@@ -2,26 +2,31 @@
 
 from __future__ import annotations
 
+import os
+
+# Windows/Conda：numpy、matplotlib 等重复链接 OpenMP 时的兼容项（见 Intel OMP Error #15）
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-from agent.analysis_graph import run_analysis_graph
-from agent.dataset_registry import (
-    DatasetInfo,
-    datasets_to_dict,
-    merge_previews_for_legacy,
-    primary_dataset,
+from agent.analysis_tasks import (
+    STATUS_LABELS,
+    advance_task_queue,
+    enqueue_analysis_task,
+    get_running_task,
+    get_selected_task,
+    init_task_state,
+    remove_task,
+    request_cancel_task,
+    task_summary_label,
 )
-from agent.report_generator import (
-    ReportGenerationError,
-    build_fallback_report,
-    generate_markdown_report,
-    save_report_markdown,
-)
+from agent.dataset_registry import DatasetInfo
 from config.settings import (
+    MAX_OUTPUT_TABLES,
     MAX_TOTAL_UPLOAD_BYTES,
     MAX_TOTAL_UPLOAD_MB,
     MAX_UPLOAD_FILES,
@@ -54,54 +59,131 @@ _CHART_TYPE_LABELS: dict[str, str] = {
     "box": "箱线图",
 }
 
+if hasattr(st, "fragment"):
+    _st_fragment = st.fragment
+elif hasattr(st, "experimental_fragment"):
+    _st_fragment = st.experimental_fragment
+else:
+
+    def _st_fragment(**_kwargs: Any):
+        def decorator(func):
+            return func
+
+        return decorator
+
+if hasattr(st, "dialog"):
+    _st_dialog = st.dialog
+elif hasattr(st, "experimental_dialog"):
+    _st_dialog = st.experimental_dialog
+else:
+
+    def _st_dialog(_title: str):
+        def decorator(func):
+            return func
+
+        return decorator
+
 
 def _init_session_state() -> None:
     defaults = {
         "datasets": None,
-        "generated_code": "",
-        "sandbox_ok": None,
-        "report_markdown": "",
-        "report_path": None,
-        "result_csv_bytes": None,
-        "result_csv_name": "processed_result.csv",
-        "retry_history": [],
-        "graph_attempts": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    init_task_state(st.session_state)
 
 
-def _exportable_dataframe(sandbox_result) -> pd.DataFrame | None:
-    """从沙箱结果中提取可导出的表格（优先 result，其次 df）。"""
-    if sandbox_result is None or not sandbox_result.success:
+def _dataset_filenames(datasets: list[DatasetInfo]) -> str:
+    return "、".join(f"「{ds.filename}」" for ds in datasets)
+
+
+def _select_chart_dataframe(
+    datasets: list[DatasetInfo],
+    *,
+    panel_key: str,
+) -> pd.DataFrame:
+    if len(datasets) == 1:
+        return datasets[0].dataframe
+    labels = [ds.filename for ds in datasets]
+    selected = st.selectbox(
+        "选择要绘图的文件",
+        labels,
+        key=f"chart_file_{panel_key}",
+    )
+    for ds in datasets:
+        if ds.filename == selected:
+            return ds.dataframe
+    return datasets[0].dataframe
+
+
+def _chart_cache_key(panel_key: str) -> str:
+    return f"chart_cache_{panel_key}"
+
+
+def _chart_gen_id_key(panel_key: str) -> str:
+    return f"chart_gen_id_{panel_key}"
+
+
+def _render_result_tables_section(result: dict[str, Any]) -> None:
+    """展示多张输出表及各自 CSV 下载。"""
+    tables: list[dict[str, Any]] = result.get("result_tables") or []
+    truncated = result.get("result_truncated", False)
+    scalar = result.get("result_scalar")
+
+    if truncated:
+        st.warning(
+            f"输出表超过上限，仅展示前 {MAX_OUTPUT_TABLES} 张"
+            f"（可在 .env 调整 MAX_OUTPUT_TABLES）。"
+        )
+
+    if tables:
+        st.caption(f"共 {len(tables)} 张输出表（命名来自代码 result 字典键名）")
+        if len(tables) == 1:
+            item = tables[0]
+            st.dataframe(item["dataframe"], use_container_width=True)
+            st.download_button(
+                label=f"下载 {item['filename']}",
+                data=item["csv_bytes"],
+                file_name=item["filename"],
+                mime="text/csv",
+                key=f"download_result_{item['filename']}",
+            )
+        else:
+            tabs = st.tabs([str(item["name"]) for item in tables])
+            for tab, item in zip(tabs, tables):
+                with tab:
+                    shape = item.get("shape") or item["dataframe"].shape
+                    st.caption(f"{item['filename']} · {shape[0]} 行 × {shape[1]} 列")
+                    st.dataframe(item["dataframe"], use_container_width=True)
+                    st.download_button(
+                        label=f"下载 {item['filename']}",
+                        data=item["csv_bytes"],
+                        file_name=item["filename"],
+                        mime="text/csv",
+                        key=f"download_result_{item['filename']}",
+                    )
+    elif scalar is not None:
+        st.write(scalar)
+
+
+def _result_chart_dataframe(result: dict[str, Any]) -> pd.DataFrame | None:
+    """从任务结果中的输出表选取可绘图 DataFrame。"""
+    tables: list[dict[str, Any]] = result.get("result_tables") or []
+    if not tables:
         return None
-    result = sandbox_result.result
-    if isinstance(result, pd.DataFrame) and not result.empty:
-        return result
-    if isinstance(result, pd.Series):
-        return result.to_frame()
-    if sandbox_result.df is not None and not sandbox_result.df.empty:
-        return sandbox_result.df
-    return None
-
-
-def _result_chart_dataframe(sandbox_result, datasets: list[DatasetInfo]) -> pd.DataFrame | None:
-    """提取可用于结果区独立绘图的 DataFrame。"""
-    export_df = _exportable_dataframe(sandbox_result)
-    if export_df is not None:
-        return export_df
-    if sandbox_result is not None and sandbox_result.success:
-        return primary_dataset(datasets).dataframe
-    return None
-
-
-def _dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    """转为 CSV 字节流（utf-8-sig，便于 Excel 打开）。"""
-    try:
-        return df.to_csv(index=False).encode("utf-8-sig")
-    except Exception as exc:
-        raise ValueError("Failed to serialize DataFrame to CSV.") from exc
+    if len(tables) == 1:
+        return tables[0]["dataframe"]
+    labels = [str(item["name"]) for item in tables]
+    selected = st.selectbox(
+        "选择要绘图的输出表",
+        labels,
+        key="result_chart_table_pick",
+    )
+    for item in tables:
+        if item["name"] == selected:
+            return item["dataframe"]
+    return tables[0]["dataframe"]
 
 
 def _save_uploaded_file(uploaded_file) -> Path:
@@ -144,18 +226,47 @@ def _build_chart(
         return None
 
 
+def _show_chart_image(chart_path: Path) -> None:
+    """展示图表 PNG；兼容 Streamlit 1.36（无 use_container_width）。"""
+    try:
+        st.image(str(chart_path), use_container_width=True)
+    except TypeError:
+        st.image(str(chart_path), use_column_width=True)
+
+
+def _show_chart_with_actions(cache: dict[str, Any]) -> None:
+    """展示图表，并提供 PNG 下载（浏览器中可右键复制图片）。"""
+    path = Path(cache["path"])
+    png_bytes = cache.get("bytes")
+    if png_bytes is None and path.is_file():
+        png_bytes = path.read_bytes()
+    filename = str(cache.get("filename") or path.name)
+    if path.is_file():
+        _show_chart_image(path)
+    if png_bytes:
+        st.download_button(
+            label=f"下载图表 {filename}",
+            data=png_bytes,
+            file_name=filename,
+            mime="image/png",
+            key=f"download_chart_{filename}_{cache.get('gen_id', 0)}",
+        )
+        st.caption("提示：可下载 PNG，或在图表上右键「复制图片」/「另存为」。")
+
+
 def _render_standalone_chart_panel(
     *,
     panel_key: str,
     df: pd.DataFrame,
     title: str,
 ) -> None:
-    """独立图表区：选择坐标后自动出图，不依赖 LLM 分析。"""
+    """独立图表区：手动点击生成，不自动出图；可随时清除或重新选坐标。"""
     columns = [str(c) for c in df.columns]
     if len(columns) < 2:
         st.caption("至少需要 2 列才能绘图。")
         return
 
+    st.caption("选择类型与坐标后点击「生成图表」；不会自动出图，与分析互不阻塞。")
     x_default, y_default = _pick_default_columns(df)
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -181,29 +292,45 @@ def _render_standalone_chart_panel(
             key=f"chart_y_{panel_key}",
         )
 
-    chart_path = _build_chart(df, chart_type, x_col, y_col, title=title)
-    if chart_path is not None and chart_path.is_file():
-        st.image(str(chart_path), use_container_width=True)
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        generate = st.button("生成图表", key=f"chart_generate_{panel_key}")
+    with btn_col2:
+        clear = st.button("清除图表", key=f"chart_clear_{panel_key}")
+
+    gen_id_key = _chart_gen_id_key(panel_key)
+    cache_key = _chart_cache_key(panel_key)
+
+    if clear:
+        st.session_state[gen_id_key] = st.session_state.get(gen_id_key, 0) + 1
+        st.session_state.pop(cache_key, None)
+
+    if generate:
+        st.session_state[gen_id_key] = st.session_state.get(gen_id_key, 0) + 1
+        current_gen = st.session_state[gen_id_key]
+        with st.spinner("正在生成图表…"):
+            chart_path = _build_chart(df, chart_type, x_col, y_col, title=title)
+        if current_gen != st.session_state.get(gen_id_key):
+            return
+        if chart_path is not None and chart_path.is_file():
+            try:
+                st.session_state[cache_key] = {
+                    "path": str(chart_path),
+                    "bytes": chart_path.read_bytes(),
+                    "filename": chart_path.name,
+                    "gen_id": current_gen,
+                }
+            except OSError as exc:
+                st.warning(f"图表读取失败：{exc}")
+
+    cache = st.session_state.get(cache_key)
+    if cache:
+        _show_chart_with_actions(cache)
 
 
 def _render_upload_chart_section(datasets: list[DatasetInfo]) -> None:
     st.subheader("2. 数据可视化")
-    st.caption("上传后即可选坐标出图，与分析流程无关。")
-
-    if len(datasets) > 1:
-        table_options = {ds.key: ds for ds in datasets}
-        selected_key = st.selectbox(
-            "选择要绘图的表",
-            list(table_options.keys()),
-            format_func=lambda key: (
-                f"{key}（{table_options[key].filename}）"
-            ),
-            key="upload_chart_table",
-        )
-        chart_df = table_options[selected_key].dataframe
-    else:
-        chart_df = datasets[0].dataframe
-
+    chart_df = _select_chart_dataframe(datasets, panel_key="upload")
     _render_standalone_chart_panel(
         panel_key="upload",
         df=chart_df,
@@ -211,10 +338,10 @@ def _render_upload_chart_section(datasets: list[DatasetInfo]) -> None:
     )
 
 
-def _render_sidebar() -> dict[str, Any]:
-    st.sidebar.header("分析设置")
+def _render_sidebar_settings() -> dict[str, Any]:
     st.sidebar.caption(f"模型：`{OPENAI_MODEL}` · 沙箱超时：{SANDBOX_TIMEOUT_SEC}s")
     st.sidebar.caption(f"已加载改错记录：{correction_record_count()} 条")
+    st.sidebar.caption(f"输出表上限：{MAX_OUTPUT_TABLES} 张")
     enable_report = st.sidebar.checkbox("生成 Markdown 报告", value=True)
     use_fallback_report = st.sidebar.checkbox(
         "报告 LLM 失败时使用模板降级",
@@ -224,6 +351,98 @@ def _render_sidebar() -> dict[str, Any]:
         "enable_report": enable_report,
         "use_fallback_report": use_fallback_report,
     }
+
+
+@_st_dialog("确认关闭任务")
+def _confirm_close_task_dialog(task_id: str) -> None:
+    tasks: list[dict[str, Any]] = st.session_state.analysis_tasks
+    task = next((item for item in tasks if item["id"] == task_id), None)
+    if task is None:
+        st.session_state.pending_close_task_id = None
+        return
+    st.write(f"确定从列表中移除此任务？")
+    st.caption(f"「{task_summary_label(task, 60)}」")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("确认关闭", type="primary", use_container_width=True, key="dialog_close_ok"):
+            remove_task(st.session_state, task_id)
+            st.session_state.pending_close_task_id = None
+            st.rerun()
+    with col2:
+        if st.button("取消", use_container_width=True, key="dialog_close_cancel"):
+            st.session_state.pending_close_task_id = None
+            st.rerun()
+
+
+def _render_sidebar_tasks() -> None:
+    tasks: list[dict[str, Any]] = st.session_state.analysis_tasks
+    st.sidebar.header("分析任务")
+    if not tasks:
+        st.sidebar.caption("暂无任务。填写需求并点击「开始分析」后任务会出现在这里。")
+        return
+
+    for task in reversed(tasks):
+        status = str(task["status"])
+        label = STATUS_LABELS.get(status, status)
+        if task.get("cancel_requested") and status == "running":
+            label = "取消中"
+        summary = task_summary_label(task)
+        item_key = task["id"]
+
+        if status in ("completed", "failed"):
+            selected_mark = " ✓" if st.session_state.selected_task_id == item_key else ""
+            if st.sidebar.button(
+                f"{label} · {summary}{selected_mark}",
+                key=f"task_select_{item_key}",
+                use_container_width=True,
+            ):
+                st.session_state.selected_task_id = item_key
+                st.rerun()
+        else:
+            st.sidebar.markdown(f"**{label}** · {summary}")
+
+        action_col1, action_col2 = st.sidebar.columns(2)
+        with action_col1:
+            if status in ("queued", "running"):
+                if action_col1.button("取消", key=f"task_cancel_{item_key}", use_container_width=True):
+                    request_cancel_task(task)
+                    st.rerun()
+        with action_col2:
+            if status in ("completed", "failed", "cancelled"):
+                if action_col2.button("关闭", key=f"task_close_{item_key}", use_container_width=True):
+                    st.session_state.pending_close_task_id = item_key
+                    _confirm_close_task_dialog(item_key)
+        st.sidebar.divider()
+
+
+def _render_sidebar() -> dict[str, Any]:
+    _render_sidebar_tasks()
+    st.sidebar.header("分析设置")
+    options = _render_sidebar_settings()
+    return options
+
+
+@_st_fragment(run_every=1.5)
+def _poll_task_queue() -> None:
+    datasets: list[DatasetInfo] | None = st.session_state.datasets
+    changed = advance_task_queue(st.session_state, datasets)
+    if changed:
+        st.rerun()
+
+
+def _render_current_task_status() -> None:
+    tasks: list[dict[str, Any]] = st.session_state.analysis_tasks
+    running = get_running_task(tasks)
+    queued_count = sum(
+        1 for task in tasks if task["status"] == "queued" and not task.get("cancel_requested")
+    )
+    if running:
+        st.info(f"**正在处理：** {task_summary_label(running, 80)}")
+        st.caption(
+            "主界面仍可修改需求、继续排队；上方「数据可视化」与分析入口互不阻塞。"
+        )
+    if queued_count:
+        st.caption(f"排队等待：{queued_count} 个任务")
 
 
 def _render_upload_section() -> None:
@@ -263,14 +482,12 @@ def _render_upload_section() -> None:
             if len(datasets) == 1:
                 ds = datasets[0]
                 st.success(
-                    f"已加载：`{ds.filename}`（{ds.key}，"
+                    f"已加载：`{ds.filename}`（"
                     f"{ds.preview['shape'][0]} 行 × {ds.preview['shape'][1]} 列）"
                 )
             else:
-                summary = "、".join(
-                    f"`{ds.key}`（{ds.filename}）" for ds in datasets
-                )
-                st.success(f"已加载 {len(datasets)} 张表：{summary}")
+                summary = "、".join(f"`{ds.filename}`" for ds in datasets)
+                st.success(f"已加载 {len(datasets)} 个文件：{summary}")
 
         except Exception as exc:
             st.session_state.datasets = None
@@ -285,7 +502,7 @@ def _render_upload_section() -> None:
         if len(datasets) == 1:
             st.dataframe(datasets[0].dataframe.head(15), use_container_width=True)
         else:
-            tabs = st.tabs([f"{ds.key}" for ds in datasets])
+            tabs = st.tabs([ds.filename for ds in datasets])
             for tab, ds in zip(tabs, datasets):
                 with tab:
                     shape = ds.preview["shape"]
@@ -301,167 +518,40 @@ def _render_analysis_section(options: dict[str, Any]) -> None:
         st.info("请先上传并解析数据文件。")
         return
 
+    _poll_task_queue()
+    _render_current_task_status()
+
     st.subheader("3. 描述分析需求")
     if len(datasets) > 1:
-        keys_hint = "、".join(ds.key for ds in datasets)
+        f1, f2 = datasets[0].filename, datasets[1].filename
         placeholder = (
-            f"例如：将 {datasets[0].key} 与 {datasets[1].key} 按 id 关联，"
-            "汇总各品类金额并删除空值"
+            f"例如：将「{f1}」与「{f2}」按 id 关联，"
+            "输出「品类汇总」和「清洗明细」两张表"
         )
-        st.caption(f"已加载表变量：{keys_hint}（df 为 {datasets[0].key} 的别名）")
+        st.caption(f"已加载文件：{_dataset_filenames(datasets)}")
     else:
         placeholder = "例如：删除 amount 为空的行，按 category 汇总 value 并求和"
+        st.caption(f"已加载文件：{datasets[0].filename}")
 
     user_request = st.text_area(
-        "用自然语言描述你想做的清洗或分析",
+        "用自然语言描述你想做的清洗或分析（可直接写文件名）",
         placeholder=placeholder,
         height=120,
+        key="user_analysis_request",
     )
 
     if st.button("开始分析", type="primary", use_container_width=True):
         if not user_request.strip():
             st.error("请填写分析需求。")
-            return
-        _run_analysis_pipeline(
-            user_request=user_request.strip(),
-            options=options,
-        )
-
-
-def _run_analysis_pipeline(
-    *,
-    user_request: str,
-    options: dict[str, Any],
-) -> None:
-    datasets: list[DatasetInfo] = st.session_state.datasets
-    preview = merge_previews_for_legacy(datasets)
-    df_dict = datasets_to_dict(datasets)
-
-    st.session_state.report_markdown = ""
-    st.session_state.report_path = None
-    st.session_state.result_csv_bytes = None
-
-    with st.status("分析进行中...", expanded=True) as status:
-        st.write("运行 LangGraph 工作流（生成代码 ↔ 沙箱执行，失败最多回溯 3 次）...")
-        try:
-            graph_result = run_analysis_graph(user_request, preview, df_dict)
-        except Exception as exc:
-            status.update(label="分析失败", state="error")
-            st.error(f"工作流异常：{exc}")
-            return
-
-        st.session_state.generated_code = graph_result.generated_code
-        st.session_state.sandbox_ok = graph_result.sandbox_result
-        st.session_state.retry_history = graph_result.retry_history
-        st.session_state.graph_attempts = graph_result.total_attempts
-
-        if graph_result.model:
-            st.write(f"模型：{graph_result.model} · 共尝试 {graph_result.total_attempts} 轮")
-
-        if graph_result.retry_history:
-            st.warning(
-                f"经历 {len(graph_result.retry_history)} 次执行失败后回溯重试"
-            )
-            for record in graph_result.retry_history:
-                st.caption(
-                    f"第 {record['attempt']} 次失败："
-                    f"{record.get('error_type')} - {record.get('error')}"
-                )
-
-        if graph_result.code_generation_error:
-            status.update(label="代码生成失败", state="error")
-            st.error(f"代码生成失败：{graph_result.code_generation_error}")
-            return
-
-        if graph_result.generated_code:
-            st.code(graph_result.generated_code, language="python")
-
-        sandbox_result = graph_result.sandbox_result
-        if sandbox_result is None:
-            status.update(label="分析失败", state="error")
-            st.error("沙箱未返回执行结果。")
-            return
-
-        if not graph_result.success:
-            status.update(label="执行失败", state="error")
-            st.error(
-                f"已达最大重试次数，仍执行失败 "
-                f"[{sandbox_result.error_type}]：{sandbox_result.error}"
-            )
-            _render_execution_results(sandbox_result)
-            _maybe_generate_report(
-                user_request,
-                preview,
-                sandbox_result,
-                graph_result.generated_code,
-                options,
-            )
-            return
-
-        st.write("代码执行成功")
-
-        export_df = _exportable_dataframe(sandbox_result)
-        if export_df is not None:
-            try:
-                st.session_state.result_csv_bytes = _dataframe_to_csv_bytes(export_df)
-                st.session_state.result_csv_name = "processed_result.csv"
-            except ValueError as exc:
-                st.session_state.result_csv_bytes = None
-                st.warning(f"结果表格导出准备失败：{exc}")
-
-        if options["enable_report"]:
-            st.write("生成分析报告...")
-            _maybe_generate_report(
-                user_request,
-                preview,
-                sandbox_result,
-                graph_result.generated_code,
-                options,
-            )
-
-        status.update(label="分析完成", state="complete")
-
-
-def _maybe_generate_report(
-    user_request: str,
-    preview: dict[str, Any],
-    sandbox_result,
-    generated_code: str,
-    options: dict[str, Any],
-) -> None:
-    try:
-        report = generate_markdown_report(
-            user_request,
-            preview,
-            sandbox_result,
-            generated_code=generated_code,
-            chart_paths=[],
-            save_to_file=True,
-            report_title="analysis_report",
-        )
-        st.session_state.report_markdown = report.markdown
-        st.session_state.report_path = (
-            str(report.saved_path) if report.saved_path else None
-        )
-    except ReportGenerationError as exc:
-        if options.get("use_fallback_report"):
-            fallback = build_fallback_report(
-                user_request,
-                preview,
-                sandbox_result,
-                generated_code=generated_code,
-                chart_paths=[],
-            )
-            try:
-                saved = save_report_markdown(fallback, title="analysis_report")
-                st.session_state.report_markdown = fallback
-                st.session_state.report_path = str(saved)
-                st.warning(f"LLM 报告失败，已使用模板报告：{exc}")
-            except Exception as save_exc:
-                st.session_state.report_markdown = fallback
-                st.warning(f"报告保存失败：{save_exc}")
         else:
-            st.error(f"报告生成失败：{exc}")
+            task = enqueue_analysis_task(
+                user_request=user_request.strip(),
+                options=options,
+                datasets=datasets,
+            )
+            st.session_state.analysis_tasks.append(task)
+            advance_task_queue(st.session_state, datasets)
+            st.rerun()
 
 
 def _render_execution_results(sandbox_result) -> None:
@@ -471,24 +561,35 @@ def _render_execution_results(sandbox_result) -> None:
 
 
 def _render_results_panel() -> None:
-    st.subheader("4. 分析结果")
+    tasks: list[dict[str, Any]] = st.session_state.analysis_tasks
+    selected = get_selected_task(tasks, st.session_state.selected_task_id)
+    if selected is None or selected["status"] not in ("completed", "failed"):
+        return
 
-    code = st.session_state.generated_code
+    result = selected["result"]
+    st.subheader("4. 分析结果")
+    st.caption(
+        f"任务：{task_summary_label(selected, 60)} · "
+        f"{STATUS_LABELS.get(selected['status'], selected['status'])}"
+    )
+
+    if result.get("error_message") and not result.get("success"):
+        st.error(result["error_message"])
+
+    code = result.get("generated_code") or ""
     if code:
         st.markdown("**生成的代码**")
         st.code(code, language="python")
 
-    retry_history = st.session_state.get("retry_history") or []
+    retry_history = result.get("retry_history") or []
     if retry_history:
-        with st.expander("回溯重试历史", expanded=False):
+        with st.expander("回溯重试历史", expanded=not result.get("success")):
             for record in retry_history:
                 st.markdown(f"**第 {record['attempt']} 次失败**")
-                st.caption(
-                    f"{record.get('error_type')} - {record.get('error')}"
-                )
+                st.caption(f"{record.get('error_type')} - {record.get('error')}")
                 st.code(record.get("code", ""), language="python")
 
-    sandbox_result = st.session_state.sandbox_ok
+    sandbox_result = result.get("sandbox_ok")
     if sandbox_result is None:
         return
 
@@ -496,40 +597,19 @@ def _render_results_panel() -> None:
 
     if sandbox_result.success:
         st.markdown("**执行结果**")
-        result = sandbox_result.result
-        if isinstance(result, pd.DataFrame):
-            st.dataframe(result, use_container_width=True)
-        elif isinstance(result, pd.Series):
-            st.dataframe(result.to_frame(), use_container_width=True)
-        else:
-            st.write(result)
+        _render_result_tables_section(result)
 
-        if sandbox_result.df is not None:
-            st.markdown("**输出数据表（df）**")
-            st.dataframe(sandbox_result.df, use_container_width=True)
-
-        result_csv = st.session_state.get("result_csv_bytes")
-        if result_csv:
-            st.download_button(
-                label="下载处理结果 CSV",
-                data=result_csv,
-                file_name=st.session_state.get("result_csv_name", "processed_result.csv"),
-                mime="text/csv",
+        chart_df = _result_chart_dataframe(result)
+        if chart_df is not None:
+            st.markdown("**处理结果可视化**")
+            st.caption("选择坐标后点击「生成图表」，与分析流程无关。")
+            _render_standalone_chart_panel(
+                panel_key="result",
+                df=chart_df,
+                title="处理结果图表",
             )
 
-        datasets: list[DatasetInfo] | None = st.session_state.datasets
-        if datasets:
-            result_df = _result_chart_dataframe(sandbox_result, datasets)
-            if result_df is not None:
-                st.markdown("**处理结果可视化**")
-                st.caption("选择坐标后直接出图，与分析流程无关。")
-                _render_standalone_chart_panel(
-                    panel_key="result",
-                    df=result_df,
-                    title="处理结果图表",
-                )
-
-    report_md = st.session_state.report_markdown
+    report_md = result.get("report_markdown") or ""
     if report_md:
         st.markdown("**分析报告**")
         st.markdown(report_md)
@@ -538,6 +618,7 @@ def _render_results_panel() -> None:
             data=report_md,
             file_name="analysis_report.md",
             mime="text/markdown",
+            key=f"download_report_{selected['id']}",
         )
 
 
@@ -551,14 +632,14 @@ def main() -> None:
 
     st.title("数据分析师 AI Agent")
     st.caption(
-        "上传表格（可多表）→ 可选坐标即时出图 → 自然语言分析 → 结果区亦可独立绘图"
+        "上传表格（可多表）→ 可选坐标即时出图 → 自然语言分析（支持排队）→ 侧边栏查看历史任务"
     )
 
     options = _render_sidebar()
     _render_upload_section()
     _render_analysis_section(options)
 
-    if st.session_state.sandbox_ok is not None or st.session_state.generated_code:
+    if st.session_state.selected_task_id:
         _render_results_panel()
 
 
